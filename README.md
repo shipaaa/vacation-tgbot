@@ -23,6 +23,16 @@ documents the project for contributors.
 - best-effort cleanup of processed user input in private chats;
 - expense mirroring into an existing styled `Money` Google Table;
 - atomic undo across the internal ledger and the visible `Money` table;
+- idempotent `Money` mirroring with persistent sync status and background retries;
+- natural-language expenses and top-ups from text or Telegram voice messages;
+- recent-operation history with repeat, edit, and targeted undo;
+- account-to-account transfers and currency exchanges;
+- persistent input drafts and step-by-step Back navigation;
+- favorite operation templates for two-tap expenses;
+- an aggregated dashboard with short-lived read caching;
+- daily and per-category budgets with threshold warnings;
+- participant spending analytics for shared trips;
+- configurable daily digests in the trip timezone;
 - Telegram user allowlist;
 - Docker support.
 
@@ -39,8 +49,9 @@ flowchart LR
     Sheets --> Google["Google Sheets"]
 ```
 
-Google Sheets stores the financial data. The local JSON file only stores which
-spreadsheets are connected to each Telegram chat and which trip is active.
+Google Sheets stores the financial data. The local JSON file stores trip
+connections plus operational UI state: the active trip, panel ID, unfinished
+draft, favorites, and the last successfully sent digest date.
 
 ## Requirements
 
@@ -109,6 +120,10 @@ After that, use the inline control panel.
 | `STATE_FILE` | No | Trip registry path. Defaults to `./data/state.json`. |
 | `DEFAULT_TIMEZONE` | No | Default operation timezone for newly connected trips. |
 | `ALLOWED_TELEGRAM_USER_IDS` | Recommended | Comma-separated numeric Telegram user IDs. |
+| `OPENAI_API_KEY` | No | Enables natural-language text and Telegram voice input. |
+| `OPENAI_TEXT_MODEL` | No | Structured command parser. Defaults to `gpt-5-mini`. |
+| `OPENAI_TRANSCRIBE_MODEL` | No | Voice transcription model. Defaults to `gpt-4o-mini-transcribe`. |
+| `VOICE_MAX_SECONDS` | No | Maximum accepted voice duration. Defaults to 120 seconds. |
 
 Never commit `.env`, service account keys, `data/state.json`, or Telegram tokens.
 The provided `.gitignore` excludes the standard local paths.
@@ -127,8 +142,16 @@ In a private chat, processed text input is deleted on a best-effort basis. This
 keeps the chat focused on the current panel. If Telegram refuses deletion, the
 workflow continues normally.
 
-Conversation state is currently in memory and resets when the process restarts.
-Recorded transactions and connected-trip state remain intact.
+Unfinished input is persisted in `STATE_FILE` after every update and restored
+after a process restart. Back navigation returns to the previous logical step;
+explicit cancel or successful completion clears the draft.
+
+When `OPENAI_API_KEY` is configured, an idle chat also accepts natural Russian
+text and voice commands such as `Кофе 650 JPY наличными` or
+`Пополнил карту на 100 USD`. Complete unambiguous commands are recorded
+immediately; missing or ambiguous accounts are requested with a focused choice.
+The model only produces a structured draft. All validation and writes still go
+through `TravelService`.
 
 ## Bot Commands
 
@@ -141,6 +164,9 @@ Commands registered in the BotFather menu:
 | `/income` | Top up an account. |
 | `/accounts` | Show balances and add accounts. |
 | `/summary` | Show the trip summary. |
+| `/participants` | Compare expenses by Telegram participant. |
+| `/recent` | View, repeat, edit, or undo recent operations. |
+| `/transfer` | Transfer money or record a currency exchange. |
 | `/trips` | Manage connected trips. |
 | `/help` | Show a short usage guide. |
 
@@ -189,6 +215,11 @@ Undo marks the internal ledger row as deleted. For expenses, it also finds the
 visible `Money` row by a hidden cell note containing `tx_id`, removes that row,
 and shrinks the Google Table in the same Sheets batch update.
 
+Expense mirroring is idempotent by `tx_id`. The ledger stores sync status,
+the latest error, and the successful-sync timestamp. Failed mirrors are retried
+every minute, including after a process restart. A transfer is stored as linked
+`transfer_out` and `transfer_in` rows and is never mirrored to `Money`.
+
 ## Per-Trip Settings
 
 | Key | Purpose |
@@ -199,6 +230,10 @@ and shrinks the Google Table in the same Sheets batch update.
 | `base_currency` | Country/trip currency used in summaries. |
 | `usd_rub_rate` | RUB value of 1 USD for future transactions. |
 | `jpy_rub_rate` | RUB value of 1 JPY for future transactions. |
+| `daily_budget` | Daily spending limit in the base currency. |
+| `category_budgets_json` | Per-category trip limits as JSON. |
+| `daily_digest_enabled` | Whether the daily Telegram digest is enabled. |
+| `daily_digest_time` | Digest time in the trip timezone (`HH:MM`). |
 | `schema_version` | Internal data schema version. |
 | `layout_version` | Internal sheet layout version. |
 
@@ -267,6 +302,10 @@ The current test suite covers:
 - category summaries;
 - spreadsheet ID extraction;
 - JSON state persistence and legacy migration.
+- draft, favorites, and digest marker persistence;
+- dashboard caching and invalidation;
+- budget status and daily digest scheduling;
+- participant summaries.
 
 Google Sheets and Telegram flows still require integration or manual testing,
 especially after changes to `sheetsGateway.ts` or callback state transitions.
@@ -300,13 +339,12 @@ workbooks have been staged accidentally.
 
 ## Current Limitations
 
-- conversation state is in memory;
-- connected trips are stored in a local JSON file rather than a database;
-- only one long-polling instance is supported;
-- transfers and currency exchanges are modeled as separate expense/top-up steps;
-- arbitrary historical transaction editing is not implemented;
-- receipt OCR is not implemented;
-- failed `Money` mirroring has no durable retry queue;
+- local JSON state and long polling are designed for a single running instance,
+  not horizontal scaling;
+- category budgets cover the whole trip, while the daily budget resets by the
+  configured trip timezone;
+- the digest scheduler runs inside the bot process, so the process must be
+  running at or after the configured delivery time;
 - the visible `Money` integration currently targets a RUB/USD/JPY workbook
   structure.
 
