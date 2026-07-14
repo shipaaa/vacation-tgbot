@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { google, type sheets_v4 } from "googleapis";
 import type {
   Account,
@@ -9,6 +10,14 @@ import type {
   TravelTransaction,
 } from "../domain/types.js";
 import { convertAmounts } from "../domain/money.js";
+import {
+  MANUAL_MONEY_USER,
+  manualMoneyTransactionChanged,
+  parseManualMoneyRow,
+  transactionIdFromMoneyNote,
+  type ManualMoneySyncResult,
+} from "../domain/moneyImport.js";
+import { formatDate, parseCalendarDate } from "../domain/date.js";
 import type { GoogleAuthClient } from "./auth.js";
 
 const SHEETS = {
@@ -209,7 +218,9 @@ function transactionRow(transaction: TravelTransaction): unknown[] {
 }
 
 function dateToSerial(value: string): number {
-  const [year, month, day] = value.split("-").map(Number);
+  const parts = parseCalendarDate(value);
+  if (!parts) throw new Error(`Некорректная дата: ${value}`);
+  const { year, month, day } = parts;
   return Date.UTC(year, month - 1, day) / 86_400_000 + 25_569;
 }
 
@@ -228,9 +239,9 @@ function normalizeMoneySyncStatus(value: unknown, type: string): MoneySyncStatus
 
 function asDateString(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return new Date((value - 25_569) * 86_400_000).toISOString().slice(0, 10);
+    return formatDate(new Date((value - 25_569) * 86_400_000).toISOString().slice(0, 10));
   }
-  return asString(value).slice(0, 10);
+  return formatDate(asString(value).slice(0, 10));
 }
 
 function normalizeDateSerial(value: unknown): number {
@@ -604,16 +615,21 @@ export class GoogleSheetsGateway {
     }
 
     const settings = await this.getSettings(spreadsheetId);
+    const initialCurrencyRates: Record<string, number> = { RUB: 1 };
+    if (referenceRates.usdRub) initialCurrencyRates.USD = referenceRates.usdRub;
+    if (referenceRates.jpyRub) initialCurrencyRates.JPY = referenceRates.jpyRub;
     const defaultSettings = [
       ["trip_name", title],
       ["timezone", defaultTimezone],
       ["home_timezone", "Europe/Moscow"],
       ["base_currency", "RUB"],
+      ["base_currency_rub_rate", 1],
+      ["currency_rates_json", JSON.stringify(initialCurrencyRates)],
       ["usd_rub_rate", referenceRates.usdRub ? String(referenceRates.usdRub) : ""],
       ["jpy_rub_rate", referenceRates.jpyRub ? String(referenceRates.jpyRub) : ""],
       ["schema_version", SCHEMA_VERSION],
       ["layout_version", LAYOUT_VERSION],
-    ].filter(([key]) => !settings.has(key));
+    ].filter(([key]) => !settings.has(String(key)));
     if (defaultSettings.length) {
       await this.client.spreadsheets.values.append({
         spreadsheetId,
@@ -919,6 +935,145 @@ export class GoogleSheetsGateway {
     return { synced, failed };
   }
 
+  async syncManualMoneyTransactions(
+    spreadsheetId: string,
+    chatId: string,
+  ): Promise<ManualMoneySyncResult> {
+    const result: ManualMoneySyncResult = {
+      imported: 0,
+      updated: 0,
+      deleted: 0,
+      unresolved: 0,
+    };
+    await this.withMoneySyncLock(spreadsheetId, async () => {
+      const table = await this.getMoneyTable(spreadsheetId);
+      if (!table) return;
+      const firstDataRowIndex = table.startRowIndex + 1;
+      const firstDataRowNumber = firstDataRowIndex + 1;
+      const [values, noteResponse, accounts, transactions] = await Promise.all([
+        this.getValues(
+          spreadsheetId,
+          range("Money", `A${firstDataRowNumber}:K${table.endRowIndex}`),
+        ),
+        this.client.spreadsheets.get({
+          spreadsheetId,
+          ranges: [range("Money", `K${firstDataRowNumber}:K${table.endRowIndex}`)],
+          includeGridData: true,
+          fields: "sheets(data(rowData(values(note))))",
+        }),
+        this.getAccounts(spreadsheetId),
+        this.getTransactions(spreadsheetId),
+      ]);
+      const notes = noteResponse.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
+      const transactionsById = new Map(transactions.map((item) => [item.id, item]));
+      const presentManualIds = new Set<string>();
+      const now = new Date().toISOString();
+
+      const markDeleted = async (transaction: StoredTransaction): Promise<void> => {
+        if (transaction.deletedAt) return;
+        await this.client.spreadsheets.values.update({
+          spreadsheetId,
+          range: range(SHEETS.transactions, `U${transaction.rowNumber}`),
+          valueInputOption: "RAW",
+          requestBody: { values: [[now]] },
+        });
+        transaction.deletedAt = now;
+        result.deleted += 1;
+      };
+
+      for (let index = 0; index < values.length; index += 1) {
+        const row = values[index] ?? [];
+        const note = notes[index]?.values?.[0]?.note ?? "";
+        const notedId = transactionIdFromMoneyNote(note);
+        const existing = notedId ? transactionsById.get(notedId) : undefined;
+        const isManual = note.includes("· manual Money ·") ||
+          existing?.telegramUser === MANUAL_MONEY_USER;
+        if (notedId && !isManual) continue;
+
+        const transactionId = notedId ?? `money_${randomUUID().slice(0, 12)}`;
+        if (notedId) presentManualIds.add(notedId);
+        const parsed = parseManualMoneyRow({
+          values: row,
+          accounts,
+          chatId,
+          transactionId,
+          createdAt: existing?.createdAt,
+          now,
+        });
+        if (parsed.status === "ignored") {
+          if (existing?.telegramUser === MANUAL_MONEY_USER) await markDeleted(existing);
+          continue;
+        }
+        if (parsed.status === "unresolved") {
+          result.unresolved += 1;
+          if (existing?.telegramUser === MANUAL_MONEY_USER) await markDeleted(existing);
+          continue;
+        }
+
+        presentManualIds.add(transactionId);
+        if (!notedId) {
+          await this.client.spreadsheets.batchUpdate({
+            spreadsheetId,
+            requestBody: {
+              requests: [{
+                updateCells: {
+                  start: {
+                    sheetId: table.sheetId,
+                    rowIndex: firstDataRowIndex + index,
+                    columnIndex: 10,
+                  },
+                  rows: [{ values: [{
+                    note: `Telegram ${transactionId} · manual Money · ${parsed.transaction.accountName}`,
+                  }] }],
+                  fields: "note",
+                },
+              }],
+            },
+          });
+        }
+        if (!existing) {
+          await this.client.spreadsheets.values.append({
+            spreadsheetId,
+            range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
+            valueInputOption: "RAW",
+            insertDataOption: "INSERT_ROWS",
+            requestBody: { values: [transactionRow(parsed.transaction)] },
+          });
+          transactionsById.set(transactionId, {
+            ...parsed.transaction,
+            rowNumber: transactions.length + DATA_START_ROW + result.imported,
+          });
+          result.imported += 1;
+          continue;
+        }
+        if (
+          existing.telegramUser === MANUAL_MONEY_USER &&
+          manualMoneyTransactionChanged(existing, parsed.transaction)
+        ) {
+          await this.client.spreadsheets.values.update({
+            spreadsheetId,
+            range: range(SHEETS.transactions, `A${existing.rowNumber}:Y${existing.rowNumber}`),
+            valueInputOption: "RAW",
+            requestBody: { values: [transactionRow(parsed.transaction)] },
+          });
+          Object.assign(existing, parsed.transaction);
+          result.updated += 1;
+        }
+      }
+
+      for (const transaction of transactions) {
+        if (
+          transaction.telegramUser === MANUAL_MONEY_USER &&
+          !transaction.deletedAt &&
+          !presentManualIds.has(transaction.id)
+        ) {
+          await markDeleted(transaction);
+        }
+      }
+    });
+    return result;
+  }
+
   private queueMoneySync(
     spreadsheetId: string,
     transaction: TravelTransaction,
@@ -1151,7 +1306,7 @@ export class GoogleSheetsGateway {
   async setSetting(
     spreadsheetId: string,
     key: string,
-    value: string,
+    value: string | number,
   ): Promise<void> {
     const rows = await this.getValues(
       spreadsheetId,
@@ -1468,15 +1623,24 @@ export class GoogleSheetsGateway {
     const baseCurrency =
       `IFERROR(INDEX('Настройки'!$B$5:$B${separator}` +
       `MATCH("base_currency"${separator}'Настройки'!$A$5:$A${separator}0))${separator}"RUB")`;
+    const baseRubRate =
+      `IFERROR(VALUE(INDEX('Настройки'!$B$5:$B${separator}` +
+      `MATCH("base_currency_rub_rate"${separator}'Настройки'!$A$5:$A${separator}0)))${separator}1)`;
     const sumForPeriod = (dateFilter = "") =>
       `IF(${baseCurrency}="JPY"${separator}` +
       `SUMIFS('Траты'!$F$5:$F${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}""${dateFilter})${separator}` +
       `IF(${baseCurrency}="USD"${separator}` +
       `SUMIFS('Траты'!$E$5:$E${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}""${dateFilter})${separator}` +
-      `SUMIFS('Траты'!$D$5:$D${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}""${dateFilter})))`;
+      `IF(${baseCurrency}="RUB"${separator}` +
+      `SUMIFS('Траты'!$D$5:$D${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}""${dateFilter})${separator}` +
+      `SUMIFS('Траты'!$D$5:$D${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}""${dateFilter})/${baseRubRate})))`;
     const query = (baseColumn: "D" | "E" | "F", includeRub: boolean) =>
       `QUERY('Траты'!A5:U${separator}` +
       `"select B,sum(${baseColumn})${includeRub ? ",sum(D)" : ""} where K = 'expense' and U is null group by B label B '', sum(${baseColumn}) ''${includeRub ? ", sum(D) ''" : ""}"${separator}0)`;
+    const genericCurrencyQuery =
+      `QUERY(HSTACK('Траты'!B5:B${separator}'Траты'!D5:D/${baseRubRate}${separator}` +
+      `'Траты'!D5:D${separator}'Траты'!K5:K${separator}'Траты'!U5:U)${separator}` +
+      `"select Col1,sum(Col2),sum(Col3) where Col4 = 'expense' and Col5 is null group by Col1 label Col1 '', sum(Col2) '', sum(Col3) ''"${separator}0)`;
     const formulas = [
       {
         range: range(SHEETS.overview, "A6"),
@@ -1500,7 +1664,8 @@ export class GoogleSheetsGateway {
         range: range(SHEETS.overview, "A16"),
         values: [[
           `=IFERROR(IF(${baseCurrency}="JPY"${separator}${query("F", true)}${separator}` +
-            `IF(${baseCurrency}="USD"${separator}${query("E", true)}${separator}${query("D", false)}))${separator}"")`,
+            `IF(${baseCurrency}="USD"${separator}${query("E", true)}${separator}` +
+            `IF(${baseCurrency}="RUB"${separator}${query("D", false)}${separator}${genericCurrencyQuery})))${separator}"")`,
         ]],
       },
       {

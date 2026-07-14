@@ -2,6 +2,7 @@ import "dotenv/config";
 import { OpenAINaturalInput } from "./ai/naturalInput.js";
 import { BOT_COMMANDS, createBot } from "./bot.js";
 import { loadConfig } from "./config.js";
+import { formatDate } from "./domain/date.js";
 import { formatMoney } from "./domain/money.js";
 import { createGoogleAuth } from "./google/auth.js";
 import { GoogleSheetsGateway } from "./google/sheetsGateway.js";
@@ -48,7 +49,7 @@ async function runDailyDigests(): Promise<void> {
     for (const delivery of await service.getDueDigests()) {
       const dailyBudget = delivery.budgets.daily;
       const lines = [
-        `Итоги дня · ${delivery.localDate}`,
+        `Итоги дня · ${formatDate(delivery.localDate)}`,
         `✈ ${delivery.title}`,
         "",
         `Расходы: ${formatMoney(delivery.todaySpent, delivery.baseCurrency)}`,

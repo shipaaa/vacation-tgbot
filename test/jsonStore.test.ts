@@ -121,10 +121,10 @@ describe("JsonStateStore", () => {
     };
     await store.addFavorite("42", favorite);
     await store.incrementFavoriteUse("42", favorite.id);
-    await store.setDigestLastSent("42", japan.spreadsheetId, "2026-07-14");
+    await store.setDigestLastSent("42", japan.spreadsheetId, "14.07.2026");
 
     expect((await store.getFavorites("42"))[0]?.useCount).toBe(1);
-    expect(await store.getDigestLastSent("42", japan.spreadsheetId)).toBe("2026-07-14");
+    expect(await store.getDigestLastSent("42", japan.spreadsheetId)).toBe("14.07.2026");
     expect(await store.getActiveChatConnections()).toEqual([{ chatId: "42", connection: japan }]);
   });
 });

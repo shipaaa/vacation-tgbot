@@ -2,6 +2,7 @@ import OpenAI, { toFile } from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
+import { normalizeCurrencyCode } from "../domain/currency.js";
 
 const naturalCommandSchema = z.object({
   intent: z.enum(["expense", "income", "transfer", "balance", "summary", "unknown"]),
@@ -91,9 +92,7 @@ export class OpenAINaturalInput {
 }
 
 function normalizeCurrency(value: string | null): string | null {
-  if (!value) return null;
-  const normalized = value.trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(normalized) ? normalized : null;
+  return normalizeCurrencyCode(value);
 }
 
 function normalizeName(value: string): string {

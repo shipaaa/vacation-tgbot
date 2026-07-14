@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "../config.js";
+import { normalizeCurrencyCode } from "../domain/currency.js";
+import { dateInTimezone, formatDate } from "../domain/date.js";
 import {
   computeBalances,
   convertAmounts,
   summarizeExpenses,
   summarizeExpensesByParticipant,
 } from "../domain/money.js";
+import type { ManualMoneySyncResult } from "../domain/moneyImport.js";
 import type {
   Account,
   AccountBalance,
@@ -171,6 +174,18 @@ export class TravelService {
     );
   }
 
+  async syncManualMoney(chatId: string): Promise<ManualMoneySyncResult> {
+    const connection = await this.requireConnection(chatId);
+    const result = await this.gateway.syncManualMoneyTransactions(
+      connection.spreadsheetId,
+      chatId,
+    );
+    if (result.imported || result.updated || result.deleted) {
+      this.invalidateDashboard(connection.spreadsheetId);
+    }
+    return result;
+  }
+
   async initializeAllConnections(): Promise<{ prepared: number; failed: number }> {
     const connections = await this.stateStore.getAllConnections();
     const results = await Promise.allSettled(
@@ -309,20 +324,11 @@ export class TravelService {
       active: true,
     };
     await this.gateway.addAccount(connection.spreadsheetId, account);
-    if (account.currency === "USD" || account.currency === "JPY") {
-      await Promise.all([
-        this.gateway.setSetting(
-          connection.spreadsheetId,
-          account.currency === "USD" ? "usd_rub_rate" : "jpy_rub_rate",
-          String(account.rubRate),
-        ),
-        this.gateway.updateAccountRates(
-          connection.spreadsheetId,
-          account.currency,
-          account.rubRate,
-        ),
-      ]);
-    }
+    await this.storeCurrencyRubRate(
+      connection.spreadsheetId,
+      account.currency,
+      account.rubRate,
+    );
     this.invalidateDashboard(connection.spreadsheetId);
     return account;
   }
@@ -337,6 +343,7 @@ export class TravelService {
       this.gateway.getSettings(connection.spreadsheetId),
     ]);
     const baseCurrency = (settings.get("base_currency") || "RUB").toUpperCase();
+    const baseRubRate = currencyRubRateFromSettings(settings, baseCurrency);
     const localTimezone = settings.get("timezone") || this.config.defaultTimezone;
     const configuredHome = settings.get("home_timezone") || "Europe/Moscow";
     const homeTimezone = HOME_TIMEZONES.has(configuredHome) ? configuredHome : "Europe/Moscow";
@@ -348,11 +355,11 @@ export class TravelService {
       today: {
         date,
         baseCurrency,
-        lines: summarizeExpenses(transactions, baseCurrency, date),
+        lines: summarizeExpenses(transactions, baseCurrency, date, baseRubRate),
       },
       homeTimezone,
       localTimezone,
-      budgets: buildBudgetStatus(transactions, settings, baseCurrency, date),
+      budgets: buildBudgetStatus(transactions, settings, baseCurrency, date, baseRubRate),
       digest: {
         enabled: settings.get("daily_digest_enabled") === "true",
         time: validDigestTime(settings.get("daily_digest_time")) ?? "21:00",
@@ -448,6 +455,13 @@ export class TravelService {
     const active = await this.stateStore.getActiveChatConnections();
     const deliveries = await Promise.all(active.map(async ({ chatId, connection }) => {
       try {
+        const sync = await this.gateway.syncManualMoneyTransactions(
+          connection.spreadsheetId,
+          chatId,
+        );
+        if (sync.imported || sync.updated || sync.deleted) {
+          this.invalidateDashboard(connection.spreadsheetId);
+        }
         const dashboard = await this.getDashboard(chatId);
         if (!dashboard.digest.enabled) return null;
         const localDate = dateInTimezone(now, dashboard.localTimezone);
@@ -457,7 +471,7 @@ export class TravelService {
           chatId,
           connection.spreadsheetId,
         );
-        if (lastSent === localDate) return null;
+        if (lastSent && formatDate(lastSent) === localDate) return null;
         return {
           chatId,
           spreadsheetId: connection.spreadsheetId,
@@ -527,15 +541,54 @@ export class TravelService {
   }
 
   async setBaseCurrency(chatId: string, currency: string): Promise<string> {
-    const normalized = currency.trim().toUpperCase();
-    if (!/^[A-Z]{3}$/.test(normalized)) {
-      throw new UserFacingError("Нужен трёхбуквенный код валюты, например JPY.");
+    const normalized = normalizeCurrencyCode(currency);
+    if (!normalized) {
+      throw new UserFacingError("Не узнаю валюту. Отправь ISO-код, например GBP, AED или KZT.");
     }
     const connection = await this.requireConnection(chatId);
-    await this.gateway.setSetting(connection.spreadsheetId, "base_currency", normalized);
+    const settings = await this.gateway.getSettings(connection.spreadsheetId);
+    const rubRate = currencyRubRateFromSettings(settings, normalized);
+    if (!rubRate) {
+      throw new UserFacingError(
+        `Сначала укажи, сколько RUB стоит 1 ${normalized}.`,
+      );
+    }
+    await Promise.all([
+      this.gateway.setSetting(connection.spreadsheetId, "base_currency", normalized),
+      this.gateway.setSetting(
+        connection.spreadsheetId,
+        "base_currency_rub_rate",
+        rubRate,
+      ),
+    ]);
     await this.gateway.refreshOverview(connection.spreadsheetId);
     this.invalidateDashboard(connection.spreadsheetId);
     return normalized;
+  }
+
+  async getCurrencyRubRate(chatId: string, currency: string): Promise<number | null> {
+    const normalized = normalizeCurrencyCode(currency);
+    if (!normalized) return null;
+    const connection = await this.requireConnection(chatId);
+    return currencyRubRateFromSettings(
+      await this.gateway.getSettings(connection.spreadsheetId),
+      normalized,
+    );
+  }
+
+  async setCurrencyRubRate(
+    chatId: string,
+    currency: string,
+    rubRate: number,
+  ): Promise<void> {
+    const normalized = normalizeCurrencyCode(currency);
+    if (!normalized || !Number.isFinite(rubRate) || rubRate <= 0) {
+      throw new UserFacingError("Курс должен быть положительным числом.");
+    }
+    const connection = await this.requireConnection(chatId);
+    await this.storeCurrencyRubRate(connection.spreadsheetId, normalized, rubRate);
+    await this.gateway.refreshOverview(connection.spreadsheetId);
+    this.invalidateDashboard(connection.spreadsheetId);
   }
 
   async setRate(
@@ -544,14 +597,7 @@ export class TravelService {
     rubRate: number,
   ): Promise<void> {
     const connection = await this.requireConnection(chatId);
-    await Promise.all([
-      this.gateway.setSetting(
-        connection.spreadsheetId,
-        currency === "USD" ? "usd_rub_rate" : "jpy_rub_rate",
-        String(rubRate),
-      ),
-      this.gateway.updateAccountRates(connection.spreadsheetId, currency, rubRate),
-    ]);
+    await this.storeCurrencyRubRate(connection.spreadsheetId, currency, rubRate);
     this.invalidateDashboard(connection.spreadsheetId);
   }
 
@@ -569,8 +615,9 @@ export class TravelService {
     const account = accounts.find((candidate) => candidate.id === accountId);
     if (!account) throw new UserFacingError("Счёт больше не найден.");
     const rates = ratesFromSettings(settings);
-    const purchaseRate = rubRateForCurrency(purchaseCurrency, rates);
-    const accountRate = rubRateForCurrency(account.currency, rates, account.rubRate);
+    const currencyRates = currencyRatesFromSettings(settings);
+    const purchaseRate = rubRateForCurrency(purchaseCurrency, rates, undefined, currencyRates);
+    const accountRate = rubRateForCurrency(account.currency, rates, account.rubRate, currencyRates);
     if (!purchaseRate || !accountRate) {
       throw new UserFacingError("Не хватает курса. Укажи его через /rates.");
     }
@@ -608,7 +655,7 @@ export class TravelService {
     const transaction: TravelTransaction = {
       id: `tx_${randomUUID().slice(0, 12)}`,
       createdAt: new Date().toISOString(),
-      date: input.date ?? dateInTimezone(new Date(), timezone),
+      date: formatDate(input.date ?? dateInTimezone(new Date(), timezone)),
       type: input.type,
       accountId: account.id,
       accountName: account.name,
@@ -674,7 +721,7 @@ export class TravelService {
     const transferId = `tr_${randomUUID().slice(0, 12)}`;
     const createdAt = new Date().toISOString();
     const timezone = settings.get("timezone") || this.config.defaultTimezone;
-    const date = input.date ?? dateInTimezone(new Date(), timezone);
+    const date = formatDate(input.date ?? dateInTimezone(new Date(), timezone));
     const isExchange = sourceAccount.currency !== destinationAccount.currency;
     const category = isExchange ? "Обмен" : "Перевод";
     const description = input.description.trim() ||
@@ -781,7 +828,12 @@ export class TravelService {
     const timezone = settings.get("timezone") || this.config.defaultTimezone;
     const baseCurrency = (settings.get("base_currency") || "RUB").toUpperCase();
     const date = todayOnly ? dateInTimezone(new Date(), timezone) : undefined;
-    return { date, baseCurrency, lines: summarizeExpenses(transactions, baseCurrency, date) };
+    const baseRubRate = currencyRubRateFromSettings(settings, baseCurrency);
+    return {
+      date,
+      baseCurrency,
+      lines: summarizeExpenses(transactions, baseCurrency, date, baseRubRate),
+    };
   }
 
   async getParticipantSummary(chatId: string, todayOnly: boolean) {
@@ -793,10 +845,11 @@ export class TravelService {
     const timezone = settings.get("timezone") || this.config.defaultTimezone;
     const baseCurrency = (settings.get("base_currency") || "RUB").toUpperCase();
     const date = todayOnly ? dateInTimezone(new Date(), timezone) : undefined;
+    const baseRubRate = currencyRubRateFromSettings(settings, baseCurrency);
     return {
       date,
       baseCurrency,
-      lines: summarizeExpensesByParticipant(transactions, baseCurrency, date),
+      lines: summarizeExpensesByParticipant(transactions, baseCurrency, date, baseRubRate),
     };
   }
 
@@ -985,6 +1038,40 @@ export class TravelService {
   private invalidateDashboard(spreadsheetId: string): void {
     this.dashboardCache.delete(spreadsheetId);
   }
+
+  private async storeCurrencyRubRate(
+    spreadsheetId: string,
+    currency: string,
+    rubRate: number,
+  ): Promise<void> {
+    const settings = await this.gateway.getSettings(spreadsheetId);
+    const normalized = currency.toUpperCase();
+    const currencyRates = currencyRatesFromSettings(settings);
+    currencyRates[normalized] = normalized === "RUB" ? 1 : rubRate;
+    const updates = [
+      this.gateway.setSetting(
+        spreadsheetId,
+        "currency_rates_json",
+        JSON.stringify(currencyRates),
+      ),
+      this.gateway.updateAccountRates(spreadsheetId, normalized, currencyRates[normalized]!),
+    ];
+    if (normalized === "USD" || normalized === "JPY") {
+      updates.push(this.gateway.setSetting(
+        spreadsheetId,
+        normalized === "USD" ? "usd_rub_rate" : "jpy_rub_rate",
+        String(currencyRates[normalized]),
+      ));
+    }
+    if ((settings.get("base_currency") || "RUB").toUpperCase() === normalized) {
+      updates.push(this.gateway.setSetting(
+        spreadsheetId,
+        "base_currency_rub_rate",
+        currencyRates[normalized]!,
+      ));
+    }
+    await Promise.all(updates);
+  }
 }
 
 function ratesFromSettings(settings: Map<string, string>): ExchangeRates {
@@ -994,17 +1081,51 @@ function ratesFromSettings(settings: Map<string, string>): ExchangeRates {
   };
 }
 
+function currencyRatesFromSettings(settings: Map<string, string>): Record<string, number> {
+  const result: Record<string, number> = { RUB: 1 };
+  try {
+    const parsed = JSON.parse(settings.get("currency_rates_json") || "{}") as Record<string, unknown>;
+    for (const [currency, value] of Object.entries(parsed)) {
+      if (/^[A-Z]{3}$/.test(currency) && typeof value === "number" && value > 0) {
+        result[currency] = value;
+      }
+    }
+  } catch {
+    // Invalid optional settings are ignored; dedicated USD/JPY values still work.
+  }
+  const usdRub = positiveSetting(settings.get("usd_rub_rate"));
+  const jpyRub = positiveSetting(settings.get("jpy_rub_rate"));
+  if (usdRub) result.USD = usdRub;
+  if (jpyRub) result.JPY = jpyRub;
+  return result;
+}
+
+function currencyRubRateFromSettings(
+  settings: Map<string, string>,
+  currency: string,
+): number | null {
+  const normalized = currency.toUpperCase();
+  const configured = currencyRatesFromSettings(settings)[normalized];
+  if (configured) return configured;
+  if ((settings.get("base_currency") || "").toUpperCase() === normalized) {
+    return positiveSetting(settings.get("base_currency_rub_rate"));
+  }
+  return null;
+}
+
 function buildBudgetStatus(
   transactions: StoredTransaction[],
   settings: Map<string, string>,
   baseCurrency: string,
   date: string,
+  baseRubRate: number | null,
 ): BudgetStatus {
   const dailyLimit = positiveSetting(settings.get("daily_budget"));
-  const dailySpent = summarizeExpenses(transactions, baseCurrency, date)
+  const dailySpent = summarizeExpenses(transactions, baseCurrency, date, baseRubRate)
     .reduce((sum, line) => sum + line.amountBase, 0);
   const allByCategory = new Map(
-    summarizeExpenses(transactions, baseCurrency).map((line) => [line.label, line.amountBase]),
+    summarizeExpenses(transactions, baseCurrency, undefined, baseRubRate)
+      .map((line) => [line.label, line.amountBase]),
   );
   return {
     baseCurrency,
@@ -1056,10 +1177,13 @@ function rubRateForCurrency(
   currency: string,
   rates: ExchangeRates,
   accountRate?: number,
+  currencyRates: Record<string, number> = {},
 ): number | null {
   if (currency.toUpperCase() === "RUB") return 1;
   if (currency.toUpperCase() === "USD") return rates.usdRub ?? accountRate ?? null;
   if (currency.toUpperCase() === "JPY") return rates.jpyRub ?? accountRate ?? null;
+  const configured = currencyRates[currency.toUpperCase()];
+  if (configured && configured > 0) return configured;
   return accountRate && accountRate > 0 ? accountRate : null;
 }
 
@@ -1068,19 +1192,6 @@ export function extractSpreadsheetId(input: string): string | null {
   const urlMatch = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
   if (urlMatch?.[1]) return urlMatch[1];
   return /^[a-zA-Z0-9_-]{20,}$/.test(trimmed) ? trimmed : null;
-}
-
-function dateInTimezone(date: Date, timezone: string): string {
-  try {
-    return new Intl.DateTimeFormat("sv-SE", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(date);
-  } catch {
-    return date.toISOString().slice(0, 10);
-  }
 }
 
 function timeInTimezone(date: Date, timezone: string): string {

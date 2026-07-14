@@ -12,6 +12,8 @@ import {
   type NaturalCommand,
 } from "./ai/naturalInput.js";
 import type { AppConfig } from "./config.js";
+import { normalizeCurrencyCode } from "./domain/currency.js";
+import { formatDate } from "./domain/date.js";
 import {
   calculateUsdJpyRate,
   formatMoney,
@@ -105,6 +107,8 @@ type Flow =
       openingBalance: number;
     }
   | { kind: "rate_value"; currency: "USD" | "JPY" }
+  | { kind: "base_currency_code" }
+  | { kind: "base_currency_rate"; currency: string }
   | { kind: "local_timezone" }
   | { kind: "budget_daily" }
   | { kind: "budget_category_value"; category: string }
@@ -144,6 +148,26 @@ interface BotSession {
   forceNewScreen?: boolean;
 }
 
+interface PausedFlowScreen {
+  text: string;
+  inlineKeyboard: InlineKeyboard["inline_keyboard"];
+}
+
+type FlowWithPausedScreen = Flow & { pausedScreen?: PausedFlowScreen };
+
+function getPausedScreen(flow: Flow): PausedFlowScreen | undefined {
+  return (flow as FlowWithPausedScreen).pausedScreen;
+}
+
+function pauseFlow(flow: Flow, screen: PausedFlowScreen): Flow {
+  return { ...flow, pausedScreen: screen } as unknown as Flow;
+}
+
+function resumeFlow(flow: Flow): Flow {
+  const { pausedScreen: _pausedScreen, ...activeFlow } = flow as FlowWithPausedScreen;
+  return activeFlow as Flow;
+}
+
 function isPersistedFlow(value: unknown): value is Flow {
   if (!value || typeof value !== "object" || !("kind" in value)) return false;
   const kind = (value as { kind?: unknown }).kind;
@@ -167,8 +191,15 @@ const LOCAL_TIMEZONES = [
 
 type TimezoneOption = { readonly label: string; readonly timezone: string };
 
-function mainMenu(): InlineKeyboard {
-  return new InlineKeyboard()
+function mainMenu(hasDraft = false): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  if (hasDraft) {
+    keyboard
+      .text("↩ Продолжить черновик", "flow:resume")
+      .text("× Сбросить", "flow:cancel")
+      .row();
+  }
+  return keyboard
     .text("＋ Расход", "menu:expense")
     .text("＋ Пополнение", "menu:income")
     .row()
@@ -194,7 +225,7 @@ function cancelKeyboard(): InlineKeyboard {
 }
 
 function backKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().text("← Назад", "menu:home");
+  return new InlineKeyboard().text("⌂ Главная", "menu:home");
 }
 
 function descriptionKeyboard(defaultName?: string): InlineKeyboard {
@@ -242,9 +273,10 @@ function formatTime(timezone: string): string {
 
 function baseCurrencyKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("JPY", "settings:base:JPY")
     .text("USD", "settings:base:USD")
-    .text("RUB", "settings:base:RUB")
+    .text("EUR", "settings:base:EUR")
+    .row()
+    .text("Другая валюта", "settings:base:custom")
     .row()
     .text("← Назад", "menu:settings");
 }
@@ -276,6 +308,23 @@ async function showScreen(
   text: string,
   keyboard: InlineKeyboard = mainMenu(),
 ): Promise<void> {
+  const callbackData = keyboard.inline_keyboard.flatMap((row) =>
+    row.flatMap((button) => "callback_data" in button ? [button.callback_data] : [])
+  );
+  const isMainMenu = callbackData.includes("menu:expense");
+  const isConnectOnly = callbackData.length > 0 &&
+    callbackData.every((callback) => callback === "trip:connect");
+  const hasHome = callbackData.some((callback) =>
+    callback === "menu:home" || callback === "flow:home"
+  );
+  if (!isMainMenu && !isConnectOnly && !hasHome) {
+    keyboard
+      .row()
+      .text(
+        "⌂ Главная",
+        isPersistedFlow(ctx.session.flow) ? "flow:home" : "menu:home",
+      );
+  }
   const callbackMessageId = ctx.callbackQuery?.message?.message_id;
   const targetMessageId = ctx.session.screenMessageId ?? callbackMessageId;
   if (
@@ -336,6 +385,8 @@ function shouldDeleteIncomingMessage(ctx: BotContext): boolean {
     "account_opening",
     "account_rate",
     "rate_value",
+    "base_currency_code",
+    "base_currency_rate",
     "budget_daily",
     "budget_category_value",
     "digest_time",
@@ -423,6 +474,26 @@ export function createBot(
     }
   });
 
+  async function syncManualMoneyNotice(ctx: BotContext): Promise<string> {
+    const result = await service.syncManualMoney(chatId(ctx));
+    const changes = [
+      result.imported ? `добавлено ${result.imported}` : "",
+      result.updated ? `обновлено ${result.updated}` : "",
+      result.deleted ? `удалено ${result.deleted}` : "",
+    ].filter(Boolean);
+    const lines = changes.length ? [`↻ Money: ${changes.join(", ")}.`] : [];
+    if (result.unresolved) {
+      lines.push(
+        `⚠ Не импортировано строк из Money: ${result.unresolved}. Проверь «Вид оплаты», сумму, дату и соответствующий счёт в боте.`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  function combineNotices(...notices: string[]): string {
+    return notices.filter(Boolean).join("\n");
+  }
+
   async function sendMain(ctx: BotContext, notice = ""): Promise<void> {
     const connection = await service.getConnection(chatId(ctx));
     if (!connection) {
@@ -433,6 +504,7 @@ export function createBot(
       );
       return;
     }
+    notice = combineNotices(notice, await syncManualMoneyNotice(ctx));
     const dashboard = await service.getDashboard(chatId(ctx));
     const { baseCurrency, balances, today, homeTimezone, localTimezone } = dashboard;
     const totals = today.lines.reduce(
@@ -463,7 +535,7 @@ export function createBot(
       ...balanceLines,
       ...(balances.length > 4 ? [`• Ещё счетов: ${balances.length - 4}`] : []),
     ];
-    await showScreen(ctx, lines.join("\n"), mainMenu());
+    await showScreen(ctx, lines.join("\n"), mainMenu(Boolean(getPausedScreen(ctx.session.flow))));
   }
 
   async function connectSpreadsheet(ctx: BotContext, input: string): Promise<void> {
@@ -478,6 +550,32 @@ export function createBot(
     } catch (error) {
       await replyError(ctx, error);
     }
+  }
+
+  async function selectBaseCurrency(ctx: BotContext, input: string): Promise<void> {
+    const currency = normalizeCurrencyCode(input);
+    if (!currency) {
+      ctx.session.flow = { kind: "base_currency_code" };
+      await showScreen(
+        ctx,
+        "Не узнаю валюту. Отправь международный код из трёх букв, например GBP, AED или KZT. Можно также написать: евро, тенге, дирхам, фунт.",
+        cancelKeyboard(),
+      );
+      return;
+    }
+    const rubRate = await service.getCurrencyRubRate(chatId(ctx), currency);
+    if (rubRate) {
+      await service.setBaseCurrency(chatId(ctx), currency);
+      ctx.session.flow = { kind: "idle" };
+      await sendSettings(ctx, `✓ Базовая валюта изменена на ${currency}.`);
+      return;
+    }
+    ctx.session.flow = { kind: "base_currency_rate", currency };
+    await showScreen(
+      ctx,
+      `Для расчёта общей сводки нужен курс.\n\nСколько RUB стоит 1 ${currency}?`,
+      cancelKeyboard(),
+    );
   }
 
   async function startConnect(ctx: BotContext): Promise<void> {
@@ -507,7 +605,7 @@ export function createBot(
         keyboard.row().url("↗ Открыть таблицу", spreadsheetUrl(active.spreadsheetId));
         keyboard.text("× Отключить", `trip:remove:${active.spreadsheetId}`);
       }
-      keyboard.row().text("← Назад", "menu:home");
+      keyboard.row().text("⌂ Главная", "menu:home");
       await showScreen(
         ctx,
         active ? `Поездки\n\nАктивна: ${active.title}` : "Поездки\n\nПодключённых таблиц пока нет.",
@@ -544,6 +642,7 @@ export function createBot(
 
   async function sendAccounts(ctx: BotContext, notice = ""): Promise<void> {
     try {
+      notice = combineNotices(notice, await syncManualMoneyNotice(ctx));
       const [balances, connection] = await Promise.all([
         service.getBalances(chatId(ctx)),
         service.getConnection(chatId(ctx)),
@@ -554,7 +653,7 @@ export function createBot(
       const keyboard = new InlineKeyboard()
         .text("＋ Добавить счёт", "account:add")
         .row()
-        .text("← Назад", "menu:home");
+        .text("⌂ Главная", "menu:home");
       await showScreen(
         ctx,
         [
@@ -572,6 +671,7 @@ export function createBot(
 
   async function sendSummary(ctx: BotContext, todayOnly: boolean): Promise<void> {
     try {
+      const moneyNotice = await syncManualMoneyNotice(ctx);
       const [summary, connection] = await Promise.all([
         service.getSummary(chatId(ctx), todayOnly),
         service.getConnection(chatId(ctx)),
@@ -588,7 +688,9 @@ export function createBot(
         }),
         { base: 0, rub: 0 },
       );
-      const period = todayOnly ? `сегодня, ${summary.date}` : "вся поездка";
+      const period = todayOnly
+        ? `сегодня, ${formatDate(summary.date ?? "")}`
+        : "вся поездка";
       const total = lines.length
         ? `\nИтого: ${formatMoney(totals.base, summary.baseCurrency)}` +
           (showRub ? ` · ${formatMoney(totals.rub, "RUB")}` : "")
@@ -599,8 +701,9 @@ export function createBot(
         .row()
         .text("По участникам", `participants:${todayOnly ? "today" : "all"}`)
         .row()
-        .text("← Назад", "menu:home");
+        .text("⌂ Главная", "menu:home");
       await showScreen(ctx, [
+        ...(moneyNotice ? [moneyNotice, ""] : []),
         `Сводка · ${period}\n${connection?.title ?? "Поездка"}`,
         "",
         ...(lines.length ? lines : ["Расходов пока нет."]),
@@ -613,6 +716,7 @@ export function createBot(
 
   async function sendParticipantSummary(ctx: BotContext, todayOnly: boolean): Promise<void> {
     try {
+      const moneyNotice = await syncManualMoneyNotice(ctx);
       const [summary, connection] = await Promise.all([
         service.getParticipantSummary(chatId(ctx), todayOnly),
         service.getConnection(chatId(ctx)),
@@ -624,7 +728,8 @@ export function createBot(
       await showScreen(
         ctx,
         [
-          `Участники · ${todayOnly ? `сегодня, ${summary.date}` : "вся поездка"}`,
+          ...(moneyNotice ? [moneyNotice, ""] : []),
+          `Участники · ${todayOnly ? `сегодня, ${formatDate(summary.date ?? "")}` : "вся поездка"}`,
           connection?.title ?? "Поездка",
           "",
           ...(lines.length ? lines : ["Расходов пока нет."]),
@@ -648,17 +753,18 @@ export function createBot(
         ? "⇄"
         : "+";
     const name = compactTitle(transaction.description || transaction.category);
-    return `${transaction.date.slice(5)} · ${marker}${formatMoney(transaction.purchaseAmount, transaction.purchaseCurrency)} · ${name}`;
+    return `${formatDate(transaction.date)} · ${marker}${formatMoney(transaction.purchaseAmount, transaction.purchaseCurrency)} · ${name}`;
   }
 
   async function sendRecentTransactions(ctx: BotContext, notice = ""): Promise<void> {
     try {
+      notice = combineNotices(notice, await syncManualMoneyNotice(ctx));
       const transactions = await service.getRecentTransactions(chatId(ctx), 10);
       const keyboard = new InlineKeyboard();
       for (const transaction of transactions) {
         keyboard.text(recentTransactionLabel(transaction), `history:view:${transaction.id}`).row();
       }
-      keyboard.text("← Назад", "menu:home");
+      keyboard.text("⌂ Главная", "menu:home");
       await showScreen(
         ctx,
         [
@@ -690,7 +796,7 @@ export function createBot(
           .text("×", `favorite:remove:${favorite.id}`)
           .row();
       });
-      keyboard.text("← Назад", "menu:home");
+      keyboard.text("⌂ Главная", "menu:home");
       await showScreen(
         ctx,
         [
@@ -722,7 +828,7 @@ export function createBot(
           ctx,
           [
             ...(notice ? [notice, ""] : []),
-            `${isExchange ? "Обмен" : "Перевод"} · ${pair.source.date}`,
+            `${isExchange ? "Обмен" : "Перевод"} · ${formatDate(pair.source.date)}`,
             pair.source.description,
             `− ${formatMoney(pair.source.amount, pair.source.currency)} · ${pair.source.accountName}`,
             `+ ${formatMoney(pair.destination.amount, pair.destination.currency)} · ${pair.destination.accountName}`,
@@ -754,7 +860,7 @@ export function createBot(
         ctx,
         [
           ...(notice ? [notice, ""] : []),
-          `${kind} · ${transaction.date}`,
+          `${kind} · ${formatDate(transaction.date)}`,
           transaction.description || transaction.category,
           `${formatMoney(transaction.purchaseAmount, transaction.purchaseCurrency)} · ${transaction.category}`,
           `Счёт: ${transaction.accountName}`,
@@ -860,7 +966,7 @@ export function createBot(
           .row()
           .text("Ежедневный digest", "menu:digest")
           .row()
-          .text("← Назад", "menu:home"),
+          .text("⌂ Главная", "menu:home"),
       );
     } catch (error) {
       await replyError(ctx, error);
@@ -1071,6 +1177,15 @@ export function createBot(
       await sendRates(ctx);
       return;
     }
+    if (flow.kind === "base_currency_code" || flow.kind === "base_currency_rate") {
+      ctx.session.flow = { kind: "idle" };
+      await showScreen(
+        ctx,
+        "Базовая валюта страны поездки:\n\nВыбери USD или EUR либо добавь свою валюту.",
+        baseCurrencyKeyboard(),
+      );
+      return;
+    }
     if (flow.kind === "local_timezone") {
       ctx.session.flow = { kind: "idle" };
       await sendSettings(ctx);
@@ -1098,7 +1213,7 @@ export function createBot(
         await showScreen(
           ctx,
           "Сначала добавь счёт.",
-          new InlineKeyboard().text("＋ Добавить счёт", "account:add").row().text("← Назад", "menu:home"),
+          new InlineKeyboard().text("＋ Добавить счёт", "account:add").row().text("⌂ Главная", "menu:home"),
         );
         return;
       }
@@ -1137,7 +1252,7 @@ export function createBot(
         await showScreen(
           ctx,
           "Для перевода нужны минимум два счёта.",
-          new InlineKeyboard().text("＋ Добавить счёт", "account:add").row().text("← Назад", "menu:home"),
+          new InlineKeyboard().text("＋ Добавить счёт", "account:add").row().text("⌂ Главная", "menu:home"),
         );
         return;
       }
@@ -1554,6 +1669,39 @@ export function createBot(
     ctx.session.flow = { kind: "idle" };
     await sendMain(ctx);
   });
+  bot.callbackQuery("flow:home", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const message = ctx.callbackQuery.message;
+    if (
+      !isPersistedFlow(ctx.session.flow) ||
+      !message ||
+      !("text" in message) ||
+      typeof message.text !== "string" ||
+      !message.reply_markup
+    ) {
+      await sendMain(ctx);
+      return;
+    }
+    ctx.session.flow = pauseFlow(ctx.session.flow, {
+      text: message.text,
+      inlineKeyboard: message.reply_markup.inline_keyboard,
+    });
+    await sendMain(ctx, "Черновик сохранён.");
+  });
+  bot.callbackQuery("flow:resume", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const pausedScreen = getPausedScreen(ctx.session.flow);
+    if (!pausedScreen) {
+      await sendMain(ctx, "Черновик уже завершён или сброшен.");
+      return;
+    }
+    ctx.session.flow = resumeFlow(ctx.session.flow);
+    await showScreen(
+      ctx,
+      pausedScreen.text,
+      InlineKeyboard.from(pausedScreen.inlineKeyboard),
+    );
+  });
   bot.callbackQuery("menu:expense", async (ctx) => {
     await ctx.answerCallbackQuery();
     await chooseAccount(ctx, "expense");
@@ -1661,7 +1809,7 @@ export function createBot(
       new InlineKeyboard()
         .text("↶ Да, отменить", "undo:confirm")
         .row()
-        .text("← Назад", "menu:home"),
+        .text("⌂ Главная", "menu:home"),
     );
   });
   bot.callbackQuery("undo:confirm", async (ctx) => {
@@ -2139,7 +2287,20 @@ export function createBot(
 
   bot.callbackQuery("settings:base", async (ctx) => {
     await ctx.answerCallbackQuery();
-    await showScreen(ctx, "Базовая валюта страны поездки:", baseCurrencyKeyboard());
+    await showScreen(
+      ctx,
+      "Базовая валюта страны поездки:\n\nВыбери USD или EUR либо добавь свою валюту.",
+      baseCurrencyKeyboard(),
+    );
+  });
+  bot.callbackQuery("settings:base:custom", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    ctx.session.flow = { kind: "base_currency_code" };
+    await showScreen(
+      ctx,
+      "Отправь код, название или символ валюты.\n\nНапример: GBP, дирхам, тенге или €.",
+      cancelKeyboard(),
+    );
   });
   bot.callbackQuery("settings:home", async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -2209,11 +2370,10 @@ export function createBot(
       await replyError(ctx, error);
     }
   });
-  bot.callbackQuery(/^settings:base:(JPY|USD|RUB)$/, async (ctx) => {
+  bot.callbackQuery(/^settings:base:(USD|EUR)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     try {
-      const currency = await service.setBaseCurrency(chatId(ctx), ctx.match[1]);
-      await sendSettings(ctx, `Базовая валюта изменена на ${currency}.`);
+      await selectBaseCurrency(ctx, ctx.match[1]);
     } catch (error) {
       await replyError(ctx, error);
     }
@@ -2229,6 +2389,29 @@ export function createBot(
     const text = ctx.message.text.trim();
     const flow = ctx.session.flow;
     try {
+      if (flow.kind === "base_currency_code") {
+        await selectBaseCurrency(ctx, text);
+        return;
+      }
+      if (flow.kind === "base_currency_rate") {
+        const rubRate = parseAmount(text);
+        if (!rubRate) {
+          await showScreen(
+            ctx,
+            `Не понял курс. Введи, сколько RUB стоит 1 ${flow.currency}. Например: 95,50.`,
+            cancelKeyboard(),
+          );
+          return;
+        }
+        await service.setCurrencyRubRate(chatId(ctx), flow.currency, rubRate);
+        await service.setBaseCurrency(chatId(ctx), flow.currency);
+        ctx.session.flow = { kind: "idle" };
+        await sendSettings(
+          ctx,
+          `✓ Базовая валюта: ${flow.currency}.\n1 ${flow.currency} = ${formatRate(rubRate)} RUB.`,
+        );
+        return;
+      }
       if (flow.kind === "digest_time") {
         const time = await service.setDigestTime(chatId(ctx), text);
         ctx.session.flow = { kind: "idle" };
@@ -2427,9 +2610,9 @@ export function createBot(
         return;
       }
       if (flow.kind === "account_currency") {
-        const currency = text.toUpperCase();
-        if (!/^[A-Z]{3}$/.test(currency)) {
-          await showScreen(ctx, "Нужен код из трёх латинских букв, например JPY.", cancelKeyboard());
+        const currency = normalizeCurrencyCode(text);
+        if (!currency) {
+          await showScreen(ctx, "Не узнаю валюту. Введи код, название или символ, например EUR, тенге или €.", cancelKeyboard());
           return;
         }
         ctx.session.flow = {
@@ -2452,12 +2635,7 @@ export function createBot(
           return;
         }
         if (flow.currency !== "RUB") {
-          const rates = await service.getRates(chatId(ctx));
-          const rubRate = flow.currency === "USD"
-            ? rates.usdRub
-            : flow.currency === "JPY"
-              ? rates.jpyRub
-              : null;
+          const rubRate = await service.getCurrencyRubRate(chatId(ctx), flow.currency);
           if (rubRate) {
             const account = await service.addAccount(
               chatId(ctx), flow.accountKind, flow.name, flow.currency, openingBalance, rubRate,

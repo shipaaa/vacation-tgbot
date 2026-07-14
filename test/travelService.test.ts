@@ -144,6 +144,12 @@ describe("TravelService dashboard and digest", () => {
       getAccounts: async () => [],
       getTransactions: async () => [],
       getSettings: async () => settings,
+      syncManualMoneyTransactions: async () => ({
+        imported: 0,
+        updated: 0,
+        deleted: 0,
+        unresolved: 0,
+      }),
     };
     const stateStore = {
       getConnection: async () => connection,
@@ -155,8 +161,49 @@ describe("TravelService dashboard and digest", () => {
     const now = new Date("2026-07-14T12:30:00.000Z");
 
     const [delivery] = await service.getDueDigests(now);
-    expect(delivery?.localDate).toBe("2026-07-14");
+    expect(delivery?.localDate).toBe("14.07.2026");
     await service.markDigestSent(delivery!);
     expect(await service.getDueDigests(now)).toEqual([]);
+
+    lastSent = "2026-07-14";
+    expect(await service.getDueDigests(now)).toEqual([]);
+  });
+});
+
+describe("TravelService custom base currency", () => {
+  it("сохраняет общий курс и использует его для произвольной базовой валюты", async () => {
+    const settings = new Map<string, string>([
+      ["timezone", "Asia/Dubai"],
+      ["base_currency", "RUB"],
+      ["base_currency_rub_rate", "1"],
+    ]);
+    const updatedRates: Array<[string, number]> = [];
+    const gateway = {
+      getAccounts: async () => [],
+      getTransactions: async () => [],
+      getSettings: async () => settings,
+      setSetting: async (_id: string, key: string, value: string) => { settings.set(key, value); },
+      updateAccountRates: async (_id: string, currency: string, rate: number) => {
+        updatedRates.push([currency, rate]);
+      },
+      refreshOverview: async () => undefined,
+    };
+    const stateStore = {
+      getConnection: async () => ({
+        spreadsheetId: "sheet",
+        title: "ОАЭ",
+        connectedAt: "2026-07-14T00:00:00.000Z",
+      }),
+    };
+    const service = new TravelService(gateway as never, stateStore as never, config);
+
+    await service.setCurrencyRubRate("42", "дирхам", 21.5);
+    await service.setBaseCurrency("42", "AED");
+
+    expect(await service.getBaseCurrency("42")).toBe("AED");
+    expect(await service.getCurrencyRubRate("42", "AED")).toBe(21.5);
+    expect(JSON.parse(settings.get("currency_rates_json")!)).toMatchObject({ RUB: 1, AED: 21.5 });
+    expect(String(settings.get("base_currency_rub_rate"))).toBe("21.5");
+    expect(updatedRates).toEqual([["AED", 21.5]]);
   });
 });

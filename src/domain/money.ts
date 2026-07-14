@@ -122,6 +122,7 @@ export function summarizeExpenses(
   transactions: StoredTransaction[],
   baseCurrency: string,
   date?: string,
+  baseRubRate?: number | null,
 ): SummaryLine[] {
   const normalizedBase = baseCurrency.toUpperCase();
   const grouped = new Map<string, { amountBase: number; amountRub: number }>();
@@ -130,7 +131,7 @@ export function summarizeExpenses(
     if (transaction.deletedAt || transaction.type !== "expense") continue;
     if (date && transaction.date !== date) continue;
     const amountRub = amountInCurrency(transaction, "RUB");
-    const amountBase = amountInCurrency(transaction, normalizedBase);
+    const amountBase = amountInCurrency(transaction, normalizedBase, baseRubRate);
     if (amountRub === null || amountBase === null) continue;
     const current = grouped.get(transaction.category) ?? { amountBase: 0, amountRub: 0 };
     grouped.set(transaction.category, {
@@ -155,6 +156,7 @@ export function summarizeExpensesByParticipant(
   transactions: StoredTransaction[],
   baseCurrency: string,
   date?: string,
+  baseRubRate?: number | null,
 ): ParticipantSummaryLine[] {
   const normalizedBase = baseCurrency.toUpperCase();
   const grouped = new Map<string, ParticipantSummaryLine>();
@@ -162,7 +164,7 @@ export function summarizeExpensesByParticipant(
     if (transaction.deletedAt || transaction.type !== "expense") continue;
     if (date && transaction.date !== date) continue;
     const amountRub = amountInCurrency(transaction, "RUB");
-    const amountBase = amountInCurrency(transaction, normalizedBase);
+    const amountBase = amountInCurrency(transaction, normalizedBase, baseRubRate);
     if (amountRub === null || amountBase === null) continue;
     const participant = transaction.telegramUser.trim() || "Неизвестный участник";
     const current = grouped.get(participant) ?? {
@@ -182,6 +184,7 @@ export function summarizeExpensesByParticipant(
 export function amountInCurrency(
   transaction: StoredTransaction,
   currency: string,
+  targetRubRate?: number | null,
 ): number | null {
   const target = currency.toUpperCase();
   if (target === "RUB") {
@@ -201,6 +204,9 @@ export function amountInCurrency(
   }
   if (transaction.purchaseCurrency.toUpperCase() === target) return transaction.purchaseAmount;
   if (transaction.currency.toUpperCase() === target) return transaction.amount;
+  if (transaction.amountRub !== null && targetRubRate && targetRubRate > 0) {
+    return transaction.amountRub / targetRubRate;
+  }
   return null;
 }
 

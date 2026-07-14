@@ -36,7 +36,7 @@ const transactions: StoredTransaction[] = [
   {
     id: "1",
     createdAt: "2026-07-14T10:00:00.000Z",
-    date: "2026-07-14",
+    date: "14.07.2026",
     type: "expense",
     accountId: "cash",
     accountName: "Наличные",
@@ -64,7 +64,7 @@ const transactions: StoredTransaction[] = [
   {
     id: "2",
     createdAt: "2026-07-14T11:00:00.000Z",
-    date: "2026-07-14",
+    date: "14.07.2026",
     type: "income",
     accountId: "cash",
     accountName: "Наличные",
@@ -92,7 +92,7 @@ const transactions: StoredTransaction[] = [
   {
     id: "3",
     createdAt: "2026-07-13T11:00:00.000Z",
-    date: "2026-07-13",
+    date: "13.07.2026",
     type: "expense",
     accountId: "card",
     accountName: "Карта",
@@ -174,7 +174,7 @@ describe("computeBalances", () => {
 
 describe("summarizeExpenses", () => {
   it("группирует расходы в базовой валюте и рублях", () => {
-    expect(summarizeExpenses(transactions, "JPY", "2026-07-14")).toEqual([
+    expect(summarizeExpenses(transactions, "JPY", "14.07.2026")).toEqual([
       {
         label: "Питание",
         baseCurrency: "JPY",
@@ -185,11 +185,22 @@ describe("summarizeExpenses", () => {
   });
 
   it("использует сохранённый курс операции для другой базовой валюты", () => {
-    expect(summarizeExpenses(transactions, "USD", "2026-07-14")).toEqual([
+    expect(summarizeExpenses(transactions, "USD", "14.07.2026")).toEqual([
       {
         label: "Питание",
         baseCurrency: "USD",
         amountBase: 600 / 77,
+        amountRub: 600,
+      },
+    ]);
+  });
+
+  it("пересчитывает RUB-суммы в произвольную базовую валюту по её курсу", () => {
+    expect(summarizeExpenses(transactions, "EUR", "14.07.2026", 100)).toEqual([
+      {
+        label: "Питание",
+        baseCurrency: "EUR",
+        amountBase: 6,
         amountRub: 600,
       },
     ]);
@@ -211,7 +222,7 @@ describe("summarizeExpensesByParticipant", () => {
         rowNumber: 5,
       },
     ];
-    expect(summarizeExpensesByParticipant(shared, "JPY", "2026-07-14")).toEqual([
+    expect(summarizeExpensesByParticipant(shared, "JPY", "14.07.2026")).toEqual([
       { participant: "user", count: 1, amountBase: 1200, amountRub: 600 },
       { participant: "@anna", count: 1, amountBase: 600, amountRub: 300 },
     ]);

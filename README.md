@@ -15,7 +15,8 @@ documents the project for contributors.
 - cash, card, and custom accounts in different currencies;
 - separate purchase price and actual account debit;
 - RUB, USD, and JPY conversion with historical rates per transaction;
-- configurable base currency and exchange rates;
+- USD/EUR quick base-currency choice plus any valid ISO currency by code,
+  common Russian name, or symbol;
 - account balances and category summaries;
 - today/all-trip summary in the trip currency and RUB;
 - configurable home clock on the dashboard;
@@ -138,6 +139,9 @@ The bot maintains one editable dashboard message per in-memory session. It shows
 - current account balances;
 - action buttons for expenses, top-ups, accounts, summaries, trips, and settings.
 
+Calendar dates shown in Telegram and Google Sheets use `DD.MM.YYYY`, for
+example `14.07.2026`.
+
 In a private chat, processed text input is deleted on a best-effort basis. This
 keeps the chat focused on the current panel. If Telegram refuses deletion, the
 workflow continues normally.
@@ -145,6 +149,8 @@ workflow continues normally.
 Unfinished input is persisted in `STATE_FILE` after every update and restored
 after a process restart. Back navigation returns to the previous logical step;
 explicit cancel or successful completion clears the draft.
+Nested screens also include a `⌂ Главная` action. During a multi-step workflow,
+it pauses the current screen and adds a resume-draft action to the dashboard.
 
 When `OPENAI_API_KEY` is configured, an idle chat also accepts natural Russian
 text and voice commands such as `Кофе 650 JPY наличными` or
@@ -197,6 +203,13 @@ blocks below the table without overwriting them.
 Top-ups are not mirrored to `Money`, because it represents spending rather than
 all account movements.
 
+Paid rows entered directly into `Money` are imported back into the internal
+ledger when the Telegram dashboard, accounts, summaries, or recent operations
+are opened. The bot assigns a hidden `tx_id` note before importing, so retries
+do not create duplicates. Later edits and physical deletions of an imported row
+are reflected on the next refresh. `Вид оплаты` is matched to exactly one bot
+account; ambiguous rows are left untouched and reported in Telegram.
+
 The original `Overview` sheet is treated as itinerary data and is never modified.
 
 ### Internal sheets
@@ -210,6 +223,10 @@ The bot creates and hides these sheets:
 | `Категории` | Editable category dictionary and ordering. |
 | `Настройки` | Per-trip settings and schema versions. |
 | `Обзор` | Formula-based fallback dashboard for workbooks without compatible `Money`. |
+
+These sheets are the bot's database and must not be deleted. They remain hidden
+in normal use. `Money` intentionally lacks the IDs, top-ups, transfers, account
+links, audit fields, and settings required to replace them.
 
 Undo marks the internal ledger row as deleted. For expenses, it also finds the
 visible `Money` row by a hidden cell note containing `tx_id`, removes that row,
@@ -228,6 +245,8 @@ every minute, including after a process restart. A transfer is stored as linked
 | `timezone` | Operation date and "today" timezone. |
 | `home_timezone` | Reference clock shown on the Telegram dashboard. Defaults to `Europe/Moscow`. |
 | `base_currency` | Country/trip currency used in summaries. |
+| `base_currency_rub_rate` | RUB value of 1 current base-currency unit. |
+| `currency_rates_json` | RUB rates for arbitrary ISO currencies used by accounts and summaries. |
 | `usd_rub_rate` | RUB value of 1 USD for future transactions. |
 | `jpy_rub_rate` | RUB value of 1 JPY for future transactions. |
 | `daily_budget` | Daily spending limit in the base currency. |
@@ -250,6 +269,13 @@ Each transaction keeps both:
 It also stores calculated RUB, USD, and JPY values plus USD/JPY, USD/RUB, and
 JPY/RUB rates. Existing transactions retain their historical rates when trip
 settings change.
+
+The base-currency screen keeps USD and EUR as quick actions. `Другая валюта`
+accepts any currency code supported by the runtime (`GBP`, `AED`, `KZT`, and so
+on) and common Russian names or symbols such as `евро`, `тенге`, `$`, `€`, or
+`£`. No AI call is used for this parsing. The first use of a currency asks for
+its RUB rate; totals in an arbitrary base currency are derived from the stored
+historical RUB amount using that configured base rate.
 
 Balances use the actual account movement:
 
