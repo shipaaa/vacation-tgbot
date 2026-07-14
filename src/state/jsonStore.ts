@@ -5,6 +5,29 @@ import type { SheetConnection } from "../domain/types.js";
 interface ChatState {
   connections: Record<string, SheetConnection>;
   activeSpreadsheetId: string | null;
+  screenMessageId?: number;
+  botDraft?: unknown;
+  favorites?: Record<string, FavoriteOperation[]>;
+  digestLastSent?: Record<string, string>;
+}
+
+export interface FavoriteOperation {
+  id: string;
+  name: string;
+  type: "expense" | "income";
+  accountId: string;
+  accountAmount: number;
+  purchaseAmount: number;
+  purchaseCurrency: string;
+  category: string;
+  description: string;
+  createdAt: string;
+  useCount: number;
+}
+
+export interface ActiveChatConnection {
+  chatId: string;
+  connection: SheetConnection;
 }
 
 interface StoredState {
@@ -41,6 +64,137 @@ export class JsonStateStore {
     return Object.values(chat.connections).sort(
       (left, right) => right.connectedAt.localeCompare(left.connectedAt),
     );
+  }
+
+  async getAllConnections(): Promise<SheetConnection[]> {
+    const unique = new Map<string, SheetConnection>();
+    for (const chat of Object.values((await this.load()).chats)) {
+      for (const connection of Object.values(chat.connections)) {
+        const current = unique.get(connection.spreadsheetId);
+        if (!current || connection.connectedAt > current.connectedAt) {
+          unique.set(connection.spreadsheetId, connection);
+        }
+      }
+    }
+    return [...unique.values()];
+  }
+
+  async getActiveChatConnections(): Promise<ActiveChatConnection[]> {
+    const result: ActiveChatConnection[] = [];
+    for (const [chatId, chat] of Object.entries((await this.load()).chats)) {
+      if (!chat.activeSpreadsheetId) continue;
+      const connection = chat.connections[chat.activeSpreadsheetId];
+      if (connection) result.push({ chatId, connection });
+    }
+    return result;
+  }
+
+  async getDigestLastSent(chatId: string, spreadsheetId: string): Promise<string | null> {
+    return (await this.load()).chats[chatId]?.digestLastSent?.[spreadsheetId] ?? null;
+  }
+
+  async setDigestLastSent(
+    chatId: string,
+    spreadsheetId: string,
+    localDate: string,
+  ): Promise<void> {
+    const state = await this.load();
+    const chat = state.chats[chatId];
+    if (!chat) return;
+    chat.digestLastSent ??= {};
+    chat.digestLastSent[spreadsheetId] = localDate;
+    await this.queuePersist(state);
+  }
+
+  async getScreenMessageId(chatId: string): Promise<number | null> {
+    const messageId = (await this.load()).chats[chatId]?.screenMessageId;
+    return Number.isInteger(messageId) && (messageId ?? 0) > 0 ? messageId ?? null : null;
+  }
+
+  async setScreenMessageId(chatId: string, messageId: number): Promise<void> {
+    if (!Number.isInteger(messageId) || messageId <= 0) return;
+    const state = await this.load();
+    const chat = state.chats[chatId] ?? {
+      connections: {},
+      activeSpreadsheetId: null,
+    };
+    chat.screenMessageId = messageId;
+    state.chats[chatId] = chat;
+    await this.queuePersist(state);
+  }
+
+  async getBotDraft(chatId: string): Promise<unknown | null> {
+    return (await this.load()).chats[chatId]?.botDraft ?? null;
+  }
+
+  async setBotDraft(chatId: string, draft: unknown): Promise<void> {
+    const state = await this.load();
+    const chat = state.chats[chatId] ?? {
+      connections: {},
+      activeSpreadsheetId: null,
+    };
+    chat.botDraft = structuredClone(draft);
+    state.chats[chatId] = chat;
+    await this.queuePersist(state);
+  }
+
+  async clearBotDraft(chatId: string): Promise<void> {
+    const state = await this.load();
+    const chat = state.chats[chatId];
+    if (!chat || chat.botDraft === undefined) return;
+    delete chat.botDraft;
+    await this.queuePersist(state);
+  }
+
+  async getFavorites(chatId: string): Promise<FavoriteOperation[]> {
+    const chat = (await this.load()).chats[chatId];
+    if (!chat?.activeSpreadsheetId) return [];
+    return [...(chat.favorites?.[chat.activeSpreadsheetId] ?? [])].sort(
+      (left, right) => right.useCount - left.useCount || right.createdAt.localeCompare(left.createdAt),
+    );
+  }
+
+  async addFavorite(chatId: string, favorite: FavoriteOperation): Promise<void> {
+    const state = await this.load();
+    const chat = state.chats[chatId];
+    if (!chat?.activeSpreadsheetId) return;
+    chat.favorites ??= {};
+    const current = chat.favorites[chat.activeSpreadsheetId] ?? [];
+    const duplicate = current.find(
+      (item) => item.type === favorite.type && item.accountId === favorite.accountId &&
+        item.purchaseAmount === favorite.purchaseAmount &&
+        item.purchaseCurrency === favorite.purchaseCurrency &&
+        item.category === favorite.category && item.description === favorite.description,
+    );
+    chat.favorites[chat.activeSpreadsheetId] = duplicate
+      ? current.map((item) => item.id === duplicate.id ? { ...item, name: favorite.name } : item)
+      : [favorite, ...current].slice(0, 20);
+    await this.queuePersist(state);
+  }
+
+  async removeFavorite(chatId: string, favoriteId: string): Promise<boolean> {
+    const state = await this.load();
+    const chat = state.chats[chatId];
+    const spreadsheetId = chat?.activeSpreadsheetId;
+    if (!chat || !spreadsheetId) return false;
+    const current = chat.favorites?.[spreadsheetId] ?? [];
+    const next = current.filter((item) => item.id !== favoriteId);
+    if (next.length === current.length) return false;
+    chat.favorites ??= {};
+    chat.favorites[spreadsheetId] = next;
+    await this.queuePersist(state);
+    return true;
+  }
+
+  async incrementFavoriteUse(chatId: string, favoriteId: string): Promise<void> {
+    const state = await this.load();
+    const chat = state.chats[chatId];
+    const spreadsheetId = chat?.activeSpreadsheetId;
+    if (!chat || !spreadsheetId) return;
+    const favorite = chat.favorites?.[spreadsheetId]?.find((item) => item.id === favoriteId);
+    if (!favorite) return;
+    favorite.useCount += 1;
+    await this.queuePersist(state);
   }
 
   async setConnection(chatId: string, connection: SheetConnection): Promise<void> {

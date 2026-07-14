@@ -3,7 +3,9 @@ import type {
   Account,
   AccountKind,
   ExchangeRates,
+  MoneySyncStatus,
   StoredTransaction,
+  TransactionType,
   TravelTransaction,
 } from "../domain/types.js";
 import { convertAmounts } from "../domain/money.js";
@@ -19,7 +21,8 @@ const SHEETS = {
 
 const DATA_START_ROW = 5;
 const GRID_ROW_COUNT = 1000;
-const LAYOUT_VERSION = "8";
+const LAYOUT_VERSION = "10";
+const SCHEMA_VERSION = "5";
 
 const TRANSACTION_HEADERS = [
   "Наименование",
@@ -43,6 +46,10 @@ const TRANSACTION_HEADERS = [
   "Пользователь Telegram",
   "ID чата",
   "Удалено",
+  "Синхронизация Money",
+  "Ошибка синхронизации Money",
+  "Синхронизировано с Money",
+  "ID перевода",
 ];
 const ACCOUNT_HEADERS = [
   "Счёт",
@@ -171,9 +178,52 @@ function moneyTransactionName(transaction: TravelTransaction): string {
   return transaction.description.trim() || transaction.category;
 }
 
+function transactionRow(transaction: TravelTransaction): unknown[] {
+  return [
+    moneyTransactionName(transaction),
+    transaction.category,
+    transaction.accountName,
+    transaction.amountRub,
+    transaction.amountUsd,
+    transaction.amountJpy,
+    transaction.usdJpyRate,
+    transaction.usdRubRate,
+    transaction.jpyRubRate,
+    dateToSerial(transaction.date),
+    transaction.type,
+    transaction.id,
+    transaction.createdAt,
+    transaction.accountId,
+    transaction.amount,
+    transaction.currency,
+    transaction.purchaseAmount,
+    transaction.purchaseCurrency,
+    transaction.telegramUser,
+    transaction.chatId,
+    transaction.deletedAt,
+    transaction.moneySyncStatus,
+    transaction.moneySyncError,
+    transaction.moneySyncedAt,
+    transaction.transferId,
+  ];
+}
+
 function dateToSerial(value: string): number {
   const [year, month, day] = value.split("-").map(Number);
   return Date.UTC(year, month - 1, day) / 86_400_000 + 25_569;
+}
+
+function userEnteredValue(value: string | number | null): sheets_v4.Schema$ExtendedValue {
+  if (typeof value === "number") return { numberValue: value };
+  return { stringValue: value ?? "" };
+}
+
+function normalizeMoneySyncStatus(value: unknown, type: string): MoneySyncStatus {
+  const status = asString(value);
+  if (["pending", "synced", "not_applicable", "failed"].includes(status)) {
+    return status as MoneySyncStatus;
+  }
+  return type === "expense" ? "pending" : "not_applicable";
 }
 
 function asDateString(value: unknown): string {
@@ -418,12 +468,15 @@ function accountBalanceFormula(rowNumber: number, separator: string): string {
   return (
     `=D${rowNumber}` +
     `+SUMIFS('Траты'!$O$5:$O${separator}'Траты'!$N$5:$N${separator}$H${rowNumber}${separator}'Траты'!$K$5:$K${separator}"income"${separator}'Траты'!$U$5:$U${separator}"")` +
-    `-SUMIFS('Траты'!$O$5:$O${separator}'Траты'!$N$5:$N${separator}$H${rowNumber}${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}"")`
+    `+SUMIFS('Траты'!$O$5:$O${separator}'Траты'!$N$5:$N${separator}$H${rowNumber}${separator}'Траты'!$K$5:$K${separator}"transfer_in"${separator}'Траты'!$U$5:$U${separator}"")` +
+    `-SUMIFS('Траты'!$O$5:$O${separator}'Траты'!$N$5:$N${separator}$H${rowNumber}${separator}'Траты'!$K$5:$K${separator}"expense"${separator}'Траты'!$U$5:$U${separator}"")` +
+    `-SUMIFS('Траты'!$O$5:$O${separator}'Траты'!$N$5:$N${separator}$H${rowNumber}${separator}'Траты'!$K$5:$K${separator}"transfer_out"${separator}'Траты'!$U$5:$U${separator}"")`
   );
 }
 
 export class GoogleSheetsGateway {
   private readonly client: sheets_v4.Sheets;
+  private readonly moneySyncLocks = new Map<string, Promise<void>>();
 
   constructor(auth: GoogleAuthClient) {
     this.client = google.sheets({ version: "v4", auth });
@@ -558,7 +611,7 @@ export class GoogleSheetsGateway {
       ["base_currency", "RUB"],
       ["usd_rub_rate", referenceRates.usdRub ? String(referenceRates.usdRub) : ""],
       ["jpy_rub_rate", referenceRates.jpyRub ? String(referenceRates.jpyRub) : ""],
-      ["schema_version", "3"],
+      ["schema_version", SCHEMA_VERSION],
       ["layout_version", LAYOUT_VERSION],
     ].filter(([key]) => !settings.has(key));
     if (defaultSettings.length) {
@@ -575,6 +628,7 @@ export class GoogleSheetsGateway {
       await this.writeOverview(spreadsheetId, title, formulaSeparator(locale));
     }
     const hasMoneyLedger = Boolean(await this.getMoneyTable(spreadsheetId));
+    await this.refreshAccountBalanceFormulas(spreadsheetId, formulaSeparator(locale));
 
     const styleRequests: sheets_v4.Schema$Request[] = [];
     for (const sheetName of setupSheets) {
@@ -615,6 +669,9 @@ export class GoogleSheetsGateway {
       layoutSettings.get("layout_version") !== LAYOUT_VERSION
     ) {
       await this.setSetting(spreadsheetId, "layout_version", LAYOUT_VERSION);
+    }
+    if (settings.get("schema_version") !== SCHEMA_VERSION) {
+      await this.setSetting(spreadsheetId, "schema_version", SCHEMA_VERSION);
     }
 
     return title;
@@ -716,44 +773,36 @@ export class GoogleSheetsGateway {
     spreadsheetId: string,
     transaction: TravelTransaction,
   ): Promise<void> {
-    await this.client.spreadsheets.values.append({
+    const response = await this.client.spreadsheets.values.append({
       spreadsheetId,
-      range: range(SHEETS.transactions, `A${DATA_START_ROW}:U`),
+      range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
       valueInputOption: "RAW",
       insertDataOption: "INSERT_ROWS",
       requestBody: {
-        values: [[
-          moneyTransactionName(transaction),
-          transaction.category,
-          transaction.accountName,
-          transaction.amountRub,
-          transaction.amountUsd,
-          transaction.amountJpy,
-          transaction.usdJpyRate,
-          transaction.usdRubRate,
-          transaction.jpyRubRate,
-          dateToSerial(transaction.date),
-          transaction.type,
-          transaction.id,
-          transaction.createdAt,
-          transaction.accountId,
-          transaction.amount,
-          transaction.currency,
-          transaction.purchaseAmount,
-          transaction.purchaseCurrency,
-          transaction.telegramUser,
-          transaction.chatId,
-          transaction.deletedAt,
-        ]],
+        values: [transactionRow(transaction)],
       },
     });
     if (transaction.type === "expense") {
-      try {
-        await this.appendExpenseToMoney(spreadsheetId, transaction);
-      } catch (error) {
-        console.error("Не удалось отразить расход на листе Money:", error);
-      }
+      const rowNumber = rowNumberFromUpdatedRange(response.data.updates?.updatedRange);
+      transaction.moneySyncStatus = await this.queueMoneySync(
+        spreadsheetId,
+        transaction,
+        rowNumber,
+      );
     }
+  }
+
+  async appendTransferTransactions(
+    spreadsheetId: string,
+    transactions: readonly [TravelTransaction, TravelTransaction],
+  ): Promise<void> {
+    await this.client.spreadsheets.values.append({
+      spreadsheetId,
+      range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: { values: transactions.map(transactionRow) },
+    });
   }
 
   async appendExpenseToMoney(
@@ -764,7 +813,30 @@ export class GoogleSheetsGateway {
     const table = await this.getMoneyTable(spreadsheetId);
     if (!table) return false;
 
-    const targetRowNumber = table.endRowIndex + 1;
+    const existingRow = await this.findMoneyTransactionRow(
+      spreadsheetId,
+      table,
+      transaction.id,
+    );
+    if (existingRow !== null) return true;
+
+    const paymentType = moneyPaymentType(transaction.accountName, transaction.currency);
+    const paymentRate = paymentType === "Наличные"
+      ? transaction.jpyRubRate
+      : transaction.usdRubRate;
+    const values: Array<string | number | null> = [
+      moneyTransactionName(transaction),
+      moneyCategory(transaction.category),
+      "Оплачено",
+      paymentType,
+      transaction.amountRub,
+      transaction.amountUsd ?? "-",
+      transaction.amountJpy ?? "-",
+      transaction.usdJpyRate ?? "-",
+      paymentRate ?? "-",
+      dateToSerial(transaction.date),
+      "",
+    ];
     await this.client.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
@@ -795,65 +867,141 @@ export class GoogleSheetsGateway {
               fields: "range",
             },
           },
-        ],
-      },
-    });
-
-    const paymentType = moneyPaymentType(transaction.accountName, transaction.currency);
-    const paymentRate = paymentType === "Наличные"
-      ? transaction.jpyRubRate
-      : transaction.usdRubRate;
-    await this.client.spreadsheets.values.update({
-      spreadsheetId,
-      range: range("Money", `A${targetRowNumber}:K${targetRowNumber}`),
-      valueInputOption: "RAW",
-      requestBody: {
-        values: [[
-          moneyTransactionName(transaction),
-          moneyCategory(transaction.category),
-          "Оплачено",
-          paymentType,
-          transaction.amountRub,
-          transaction.amountUsd ?? "-",
-          transaction.amountJpy ?? "-",
-          transaction.usdJpyRate ?? "-",
-          paymentRate ?? "-",
-          dateToSerial(transaction.date),
-          "",
-        ]],
-      },
-    });
-    await this.client.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests: [{
-          updateCells: {
-            start: {
-              sheetId: table.sheetId,
-              rowIndex: table.endRowIndex,
-              columnIndex: 10,
-            },
-            rows: [{
-              values: [{
-                note: `Telegram ${transaction.id} · ${transaction.telegramUser} · ${transaction.accountName}`,
+          {
+            updateCells: {
+              start: {
+                sheetId: table.sheetId,
+                rowIndex: table.endRowIndex,
+                columnIndex: 0,
+              },
+              rows: [{
+                values: values.map((value, index) => ({
+                  userEnteredValue: userEnteredValue(value),
+                  ...(index === 10
+                    ? { note: `Telegram ${transaction.id} · ${transaction.telegramUser} · ${transaction.accountName}` }
+                    : {}),
+                })),
               }],
-            }],
-            fields: "note",
+              fields: "userEnteredValue,note",
+            },
           },
-        }],
+        ],
       },
     });
     return true;
   }
 
+  async syncPendingMoneyTransactions(
+    spreadsheetId: string,
+    limit = 50,
+  ): Promise<{ synced: number; failed: number }> {
+    let synced = 0;
+    let failed = 0;
+    await this.withMoneySyncLock(spreadsheetId, async () => {
+      const pending = (await this.getTransactions(spreadsheetId))
+        .filter((transaction) =>
+          transaction.type === "expense" &&
+          !transaction.deletedAt &&
+          transaction.moneySyncStatus !== "synced" &&
+          transaction.moneySyncStatus !== "not_applicable"
+        )
+        .slice(0, limit);
+      for (const transaction of pending) {
+        const status = await this.syncExpenseTransaction(
+          spreadsheetId,
+          transaction,
+          transaction.rowNumber,
+        );
+        if (status === "synced") synced += 1;
+        if (status === "failed") failed += 1;
+      }
+    });
+    return { synced, failed };
+  }
+
+  private queueMoneySync(
+    spreadsheetId: string,
+    transaction: TravelTransaction,
+    rowNumber: number,
+  ): Promise<MoneySyncStatus> {
+    let result: MoneySyncStatus = "pending";
+    return this.withMoneySyncLock(spreadsheetId, async () => {
+      result = await this.syncExpenseTransaction(spreadsheetId, transaction, rowNumber);
+    }).then(() => result);
+  }
+
+  private async syncExpenseTransaction(
+    spreadsheetId: string,
+    transaction: TravelTransaction,
+    rowNumber: number,
+  ): Promise<MoneySyncStatus> {
+    try {
+      const mirrored = await this.appendExpenseToMoney(spreadsheetId, transaction);
+      const status: MoneySyncStatus = mirrored ? "synced" : "not_applicable";
+      const syncedAt = mirrored ? new Date().toISOString() : "";
+      await this.setMoneySyncState(spreadsheetId, rowNumber, status, "", syncedAt);
+      transaction.moneySyncStatus = status;
+      transaction.moneySyncError = "";
+      transaction.moneySyncedAt = syncedAt;
+      return status;
+    } catch (error) {
+      const message = String(error instanceof Error ? error.message : error).slice(0, 500);
+      console.error("Не удалось отразить расход на листе Money:", error);
+      try {
+        await this.setMoneySyncState(spreadsheetId, rowNumber, "failed", message, "");
+      } catch (statusError) {
+        console.error("Не удалось сохранить статус синхронизации Money:", statusError);
+      }
+      transaction.moneySyncStatus = "failed";
+      transaction.moneySyncError = message;
+      return "failed";
+    }
+  }
+
+  private async setMoneySyncState(
+    spreadsheetId: string,
+    rowNumber: number,
+    status: MoneySyncStatus,
+    error: string,
+    syncedAt: string,
+  ): Promise<void> {
+    await this.client.spreadsheets.values.update({
+      spreadsheetId,
+      range: range(SHEETS.transactions, `V${rowNumber}:X${rowNumber}`),
+      valueInputOption: "RAW",
+      requestBody: { values: [[status, error, syncedAt]] },
+    });
+  }
+
+  private async withMoneySyncLock(
+    spreadsheetId: string,
+    action: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.moneySyncLocks.get(spreadsheetId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(action);
+    this.moneySyncLocks.set(spreadsheetId, current);
+    try {
+      await current;
+    } finally {
+      if (this.moneySyncLocks.get(spreadsheetId) === current) {
+        this.moneySyncLocks.delete(spreadsheetId);
+      }
+    }
+  }
+
   async getTransactions(spreadsheetId: string): Promise<StoredTransaction[]> {
-    const rows = await this.getValues(spreadsheetId, range(SHEETS.transactions, `A${DATA_START_ROW}:U`));
+    const rows = await this.getValues(spreadsheetId, range(SHEETS.transactions, `A${DATA_START_ROW}:Y`));
     return rows
-      .map<StoredTransaction>((row, index) => ({
+      .map<StoredTransaction>((row, index) => {
+        const rawType = asString(row[10]);
+        const type: TransactionType = ["income", "transfer_out", "transfer_in"].includes(rawType)
+          ? rawType as TransactionType
+          : "expense";
+        return {
         id: asString(row[11]),
         createdAt: asString(row[12]),
         date: asDateString(row[9]),
-        type: asString(row[10]) === "income" ? "income" : "expense",
+        type,
         accountId: asString(row[13]),
         accountName: asString(row[2]),
         amount: asNumber(row[14]),
@@ -871,8 +1019,12 @@ export class GoogleSheetsGateway {
         telegramUser: asString(row[18]),
         chatId: asString(row[19]),
         deletedAt: asString(row[20]),
+        moneySyncStatus: normalizeMoneySyncStatus(row[21], type),
+        moneySyncError: asString(row[22]),
+        moneySyncedAt: asString(row[23]),
+        transferId: asString(row[24]),
         rowNumber: index + DATA_START_ROW,
-      }))
+      };})
       .filter((transaction) => transaction.id);
   }
 
@@ -947,6 +1099,43 @@ export class GoogleSheetsGateway {
     await this.client.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: { requests },
+    });
+  }
+
+  async markTransactionsDeleted(
+    spreadsheetId: string,
+    transactions: StoredTransaction[],
+    deletedAt: string,
+  ): Promise<void> {
+    if (!transactions.length) return;
+    if (transactions.some((transaction) => transaction.type === "expense")) {
+      throw new Error("Групповая отмена расходов должна учитывать строки Money.");
+    }
+    const metadata = await this.client.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets.properties(title,sheetId)",
+    });
+    const sheetId = metadata.data.sheets?.find(
+      (sheet) => sheet.properties?.title === SHEETS.transactions,
+    )?.properties?.sheetId;
+    if (typeof sheetId !== "number") {
+      throw new Error(`Не найден служебный лист «${SHEETS.transactions}».`);
+    }
+    await this.client.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: transactions.map((transaction) => ({
+          updateCells: {
+            start: {
+              sheetId,
+              rowIndex: transaction.rowNumber - 1,
+              columnIndex: 20,
+            },
+            rows: [{ values: [{ userEnteredValue: { stringValue: deletedAt } }] }],
+            fields: "userEnteredValue",
+          },
+        })),
+      },
     });
   }
 
@@ -1122,7 +1311,7 @@ export class GoogleSheetsGateway {
         ];
       });
       updates.push({
-        range: range(SHEETS.transactions, `A1:U${data.length + 4}`),
+        range: range(SHEETS.transactions, `A1:Y${data.length + 4}`),
         values: titledTableValues(`${title}: траты и пополнения`, TRANSACTION_HEADERS, data),
       });
       migrated.add(SHEETS.transactions);
@@ -1164,7 +1353,7 @@ export class GoogleSheetsGateway {
       data.push(
         ["usd_rub_rate", rates.usdRub ? String(rates.usdRub) : ""],
         ["jpy_rub_rate", rates.jpyRub ? String(rates.jpyRub) : ""],
-        ["schema_version", "3"],
+        ["schema_version", SCHEMA_VERSION],
       );
       updates.push({
         range: range(SHEETS.settings, `A1:B${data.length + 4}`),
@@ -1210,6 +1399,29 @@ export class GoogleSheetsGateway {
       range: range(sheetName, `A1:${columnLetter(headers.length)}4`),
       valueInputOption: "RAW",
       requestBody: { values: [[title], [], [], headers] },
+    });
+  }
+
+  private async refreshAccountBalanceFormulas(
+    spreadsheetId: string,
+    separator: string,
+  ): Promise<void> {
+    const rows = await this.getValues(
+      spreadsheetId,
+      range(SHEETS.accounts, `A${DATA_START_ROW}:H`),
+    );
+    const updates = rows.flatMap((row, index) =>
+      asString(row[7])
+        ? [{
+            range: range(SHEETS.accounts, `E${DATA_START_ROW + index}`),
+            values: [[accountBalanceFormula(DATA_START_ROW + index, separator)]],
+          }]
+        : [],
+    );
+    if (!updates.length) return;
+    await this.client.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
     });
   }
 
@@ -1307,7 +1519,7 @@ export class GoogleSheetsGateway {
         range: range(SHEETS.overview, "A32"),
         values: [[
           `=IFERROR(QUERY('Траты'!A5:U${separator}` +
-            `"select A,B,C,D,E,F,J where L is not null and U is null order by M desc label A '', B '', C '', D '', E '', F '', J '' format J 'dd.MM.yyyy'"${separator}0)${separator}"")`,
+            `"select A,B,C,D,E,F,J where L is not null and U is null and K <> 'transfer_in' order by M desc label A '', B '', C '', D '', E '', F '', J '' format J 'dd.MM.yyyy'"${separator}0)${separator}"")`,
         ]],
       },
     ];

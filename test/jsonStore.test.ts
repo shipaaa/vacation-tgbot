@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SheetConnection } from "../src/domain/types.js";
-import { JsonStateStore } from "../src/state/jsonStore.js";
+import { JsonStateStore, type FavoriteOperation } from "../src/state/jsonStore.js";
 
 const japan: SheetConnection = {
   spreadsheetId: "sheet_japan_2026_abcdefghijkl",
@@ -58,6 +58,15 @@ describe("JsonStateStore", () => {
     expect(await store.getConnection("42")).toEqual(japan);
   });
 
+  it("возвращает уникальные поездки всех чатов для фоновой синхронизации", async () => {
+    const store = new JsonStateStore(filePath);
+    await store.setConnection("42", japan);
+    await store.setConnection("43", japan);
+    await store.setConnection("43", italy);
+
+    expect(await store.getAllConnections()).toEqual([japan, italy]);
+  });
+
   it("после отключения выбирает последнюю оставшуюся поездку", async () => {
     const store = new JsonStateStore(filePath);
     await store.setConnection("42", japan);
@@ -69,5 +78,53 @@ describe("JsonStateStore", () => {
 
     const secondResult = await store.removeConnection("42", italy.spreadsheetId);
     expect(secondResult).toEqual({ removed: italy, active: null });
+  });
+
+  it("помнит сообщение панели между экземплярами хранилища", async () => {
+    const store = new JsonStateStore(filePath);
+    expect(await store.getScreenMessageId("42")).toBeNull();
+
+    await store.setScreenMessageId("42", 1234);
+
+    const reloadedStore = new JsonStateStore(filePath);
+    expect(await reloadedStore.getScreenMessageId("42")).toBe(1234);
+  });
+
+  it("восстанавливает и очищает черновик после перезапуска", async () => {
+    const store = new JsonStateStore(filePath);
+    await store.setBotDraft("42", { kind: "transaction_purchase_amount", purchaseAmount: 1200 });
+
+    const reloadedStore = new JsonStateStore(filePath);
+    expect(await reloadedStore.getBotDraft("42")).toEqual({
+      kind: "transaction_purchase_amount",
+      purchaseAmount: 1200,
+    });
+    await reloadedStore.clearBotDraft("42");
+    expect(await new JsonStateStore(filePath).getBotDraft("42")).toBeNull();
+  });
+
+  it("хранит избранное и отметку digest отдельно для активной поездки", async () => {
+    const store = new JsonStateStore(filePath);
+    await store.setConnection("42", japan);
+    const favorite: FavoriteOperation = {
+      id: "fav_1",
+      name: "Рамен",
+      type: "expense",
+      accountId: "cash",
+      accountAmount: 1200,
+      purchaseAmount: 1200,
+      purchaseCurrency: "JPY",
+      category: "Питание",
+      description: "Рамен",
+      createdAt: "2026-07-14T10:00:00.000Z",
+      useCount: 0,
+    };
+    await store.addFavorite("42", favorite);
+    await store.incrementFavoriteUse("42", favorite.id);
+    await store.setDigestLastSent("42", japan.spreadsheetId, "2026-07-14");
+
+    expect((await store.getFavorites("42"))[0]?.useCount).toBe(1);
+    expect(await store.getDigestLastSent("42", japan.spreadsheetId)).toBe("2026-07-14");
+    expect(await store.getActiveChatConnections()).toEqual([{ chatId: "42", connection: japan }]);
   });
 });

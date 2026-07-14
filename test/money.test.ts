@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   computeBalances,
+  calculateUsdJpyRate,
   convertAmounts,
+  formatMoney,
   parseAmount,
   parseSignedAmount,
   summarizeExpenses,
+  summarizeExpensesByParticipant,
 } from "../src/domain/money.js";
 import type { Account, StoredTransaction } from "../src/domain/types.js";
 
@@ -52,6 +55,10 @@ const transactions: StoredTransaction[] = [
     telegramUser: "user",
     chatId: "1",
     deletedAt: "",
+    moneySyncStatus: "synced",
+    moneySyncError: "",
+    moneySyncedAt: "2026-07-14T10:00:01.000Z",
+    transferId: "",
     rowNumber: 2,
   },
   {
@@ -76,6 +83,10 @@ const transactions: StoredTransaction[] = [
     telegramUser: "user",
     chatId: "1",
     deletedAt: "",
+    moneySyncStatus: "not_applicable",
+    moneySyncError: "",
+    moneySyncedAt: "",
+    transferId: "",
     rowNumber: 3,
   },
   {
@@ -100,6 +111,10 @@ const transactions: StoredTransaction[] = [
     telegramUser: "user",
     chatId: "1",
     deletedAt: "",
+    moneySyncStatus: "synced",
+    moneySyncError: "",
+    moneySyncedAt: "2026-07-13T11:00:01.000Z",
+    transferId: "",
     rowNumber: 4,
   },
 ];
@@ -126,6 +141,35 @@ describe("computeBalances", () => {
     expect(balances.find((item) => item.id === "cash")?.balance).toBe(13800);
     expect(balances.find((item) => item.id === "card")?.balance).toBe(90);
   });
+
+  it("учитывает обе стороны перевода и не считает их расходом", () => {
+    const transferOut: StoredTransaction = {
+      ...transactions[0]!,
+      id: "4",
+      type: "transfer_out",
+      amount: 1000,
+      purchaseAmount: 1000,
+      category: "Обмен",
+      transferId: "tr_1",
+      rowNumber: 5,
+    };
+    const transferIn: StoredTransaction = {
+      ...transactions[2]!,
+      id: "5",
+      type: "transfer_in",
+      amount: 6.5,
+      purchaseAmount: 6.5,
+      purchaseCurrency: "USD",
+      category: "Обмен",
+      transferId: "tr_1",
+      rowNumber: 6,
+    };
+    const balances = computeBalances(accounts, [...transactions, transferOut, transferIn]);
+    expect(balances.find((item) => item.id === "cash")?.balance).toBe(12800);
+    expect(balances.find((item) => item.id === "card")?.balance).toBe(96.5);
+    expect(summarizeExpenses([...transactions, transferOut, transferIn], "JPY"))
+      .toEqual(summarizeExpenses(transactions, "JPY"));
+  });
 });
 
 describe("summarizeExpenses", () => {
@@ -148,6 +192,28 @@ describe("summarizeExpenses", () => {
         amountBase: 600 / 77,
         amountRub: 600,
       },
+    ]);
+  });
+});
+
+describe("summarizeExpensesByParticipant", () => {
+  it("группирует расходы по Telegram-участнику и периоду", () => {
+    const shared: StoredTransaction[] = [
+      ...transactions,
+      {
+        ...transactions[0]!,
+        id: "participant-2",
+        telegramUser: "@anna",
+        purchaseAmount: 600,
+        amount: 600,
+        amountRub: 300,
+        amountJpy: 600,
+        rowNumber: 5,
+      },
+    ];
+    expect(summarizeExpensesByParticipant(shared, "JPY", "2026-07-14")).toEqual([
+      { participant: "user", count: 1, amountBase: 1200, amountRub: 600 },
+      { participant: "@anna", count: 1, amountBase: 600, amountRub: 300 },
     ]);
   });
 });
@@ -197,5 +263,20 @@ describe("convertAmounts", () => {
     expect(result.amountRub).toBe(1940);
     expect(result.amountUsd).toBeCloseTo(1940 / 77.065954333496, 6);
     expect(result.amountJpy).toBeCloseTo(1940 / 0.49585594377, 6);
+  });
+});
+
+describe("Telegram formatting and calculated rates", () => {
+  it("использует дробность конкретной валюты", () => {
+    expect(formatMoney(28830.7, "JPY")).toBe("28 831 JPY");
+    expect(formatMoney(14295.88, "RUB")).toBe("14 295,88 RUB");
+    expect(formatMoney(12.5, "USD")).toBe("12,5 USD");
+    expect(formatMoney(12.57, "EUR")).toBe("12,57 EUR");
+    expect(formatMoney(1.2345, "KWD")).toBe("1,235 KWD");
+  });
+
+  it("считает кросс-курс USD/JPY через рублёвые курсы", () => {
+    expect(calculateUsdJpyRate({ usdRub: 77, jpyRub: 0.5 })).toBe(154);
+    expect(calculateUsdJpyRate({ usdRub: 77, jpyRub: null })).toBeNull();
   });
 });

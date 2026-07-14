@@ -18,6 +18,7 @@
     "dotenv": "^17.4.2",
     "googleapis": "^173.0.0",
     "grammy": "^1.44.0",
+    "openai": "^6.46.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

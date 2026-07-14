@@ -1,5 +1,7 @@
-export type TransactionType = "expense" | "income";
+export type DirectTransactionType = "expense" | "income";
+export type TransactionType = DirectTransactionType | "transfer_out" | "transfer_in";
 export type AccountKind = "cash" | "card" | "other";
+export type MoneySyncStatus = "pending" | "synced" | "not_applicable" | "failed";
 
 export interface SheetConnection {
   spreadsheetId: string;
@@ -44,6 +46,10 @@ export interface TravelTransaction {
   telegramUser: string;
   chatId: string;
   deletedAt: string;
+  moneySyncStatus: MoneySyncStatus;
+  moneySyncError: string;
+  moneySyncedAt: string;
+  transferId: string;
 }
 
 export interface StoredTransaction extends TravelTransaction {

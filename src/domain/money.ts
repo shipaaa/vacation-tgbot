@@ -107,7 +107,11 @@ export function computeBalances(
         .filter((transaction) => transaction.accountId === account.id)
         .reduce(
           (sum, transaction) =>
-            sum + (transaction.type === "income" ? transaction.amount : -transaction.amount),
+            sum + (
+              transaction.type === "income" || transaction.type === "transfer_in"
+                ? transaction.amount
+                : -transaction.amount
+            ),
           0,
         );
       return { ...account, balance: account.openingBalance + movement };
@@ -140,6 +144,41 @@ export function summarizeExpenses(
     .sort((left, right) => right.amountRub - left.amountRub);
 }
 
+export interface ParticipantSummaryLine {
+  participant: string;
+  count: number;
+  amountBase: number;
+  amountRub: number;
+}
+
+export function summarizeExpensesByParticipant(
+  transactions: StoredTransaction[],
+  baseCurrency: string,
+  date?: string,
+): ParticipantSummaryLine[] {
+  const normalizedBase = baseCurrency.toUpperCase();
+  const grouped = new Map<string, ParticipantSummaryLine>();
+  for (const transaction of transactions) {
+    if (transaction.deletedAt || transaction.type !== "expense") continue;
+    if (date && transaction.date !== date) continue;
+    const amountRub = amountInCurrency(transaction, "RUB");
+    const amountBase = amountInCurrency(transaction, normalizedBase);
+    if (amountRub === null || amountBase === null) continue;
+    const participant = transaction.telegramUser.trim() || "Неизвестный участник";
+    const current = grouped.get(participant) ?? {
+      participant,
+      count: 0,
+      amountBase: 0,
+      amountRub: 0,
+    };
+    current.count += 1;
+    current.amountBase += amountBase;
+    current.amountRub += amountRub;
+    grouped.set(participant, current);
+  }
+  return [...grouped.values()].sort((left, right) => right.amountRub - left.amountRub);
+}
+
 export function amountInCurrency(
   transaction: StoredTransaction,
   currency: string,
@@ -166,9 +205,25 @@ export function amountInCurrency(
 }
 
 export function formatMoney(amount: number, currency: string): string {
+  const normalizedCurrency = currency.trim().toUpperCase();
+  let fractionDigits = 2;
+  try {
+    fractionDigits = new Intl.NumberFormat("ru-RU", {
+      style: "currency",
+      currency: normalizedCurrency,
+    }).resolvedOptions().maximumFractionDigits ?? 2;
+  } catch {
+    // Custom three-letter currencies keep the common two-decimal fallback.
+  }
   return `${new Intl.NumberFormat("ru-RU", {
-    maximumFractionDigits: 2,
-  }).format(amount)} ${currency}`;
+    maximumFractionDigits: fractionDigits,
+  }).format(amount)} ${normalizedCurrency}`;
+}
+
+export function calculateUsdJpyRate(rates: ExchangeRates): number | null {
+  const usdRub = positive(rates.usdRub);
+  const jpyRub = positive(rates.jpyRub);
+  return usdRub && jpyRub ? usdRub / jpyRub : null;
 }
 
 function positive(value: number | null | undefined): number | null {
