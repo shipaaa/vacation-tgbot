@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   Bot,
   Context,
@@ -30,6 +31,7 @@ import type {
 import {
   TravelService,
   UserFacingError,
+  type RecordOperationIds,
   type RecordedTransfer,
 } from "./services/travelService.js";
 
@@ -94,6 +96,8 @@ type Flow =
       purchaseAmount: number;
       purchaseCurrency: string;
       category: string;
+      transactionId?: string;
+      description?: string;
     }
   | { kind: "account_kind" }
   | { kind: "account_name"; accountKind: AccountKind }
@@ -114,10 +118,22 @@ type Flow =
   | { kind: "budget_category_value"; category: string }
   | { kind: "digest_time" }
   | { kind: "natural_account"; command: NaturalCommand }
-  | { kind: "history_edit_amount"; transactionId: string }
-  | { kind: "history_edit_description"; transactionId: string }
-  | { kind: "history_edit_category"; transactionId: string; categories: string[] }
-  | { kind: "history_edit_account"; transactionId: string }
+  | {
+      kind: "natural_retry";
+      command: NaturalCommand;
+      forcedAccountId?: string;
+      operationIds: RecordOperationIds;
+    }
+  | {
+      kind: "quick_record_retry";
+      action: "repeat" | "favorite";
+      referenceId: string;
+      operationIds: RecordOperationIds;
+    }
+  | { kind: "history_edit_amount"; transactionId: string; replacementTransactionId: string }
+  | { kind: "history_edit_description"; transactionId: string; replacementTransactionId: string }
+  | { kind: "history_edit_category"; transactionId: string; replacementTransactionId: string; categories: string[] }
+  | { kind: "history_edit_account"; transactionId: string; replacementTransactionId: string }
   | { kind: "transfer_source"; replaceTransferId?: string }
   | { kind: "transfer_destination"; sourceAccountId: string; replaceTransferId?: string }
   | {
@@ -129,6 +145,7 @@ type Flow =
       destinationAccountName: string;
       destinationCurrency: string;
       replaceTransferId?: string;
+      operationIds?: RecordOperationIds["transfer"];
     }
   | {
       kind: "transfer_destination_amount";
@@ -140,6 +157,20 @@ type Flow =
       destinationCurrency: string;
       sourceAmount: number;
       replaceTransferId?: string;
+      operationIds?: RecordOperationIds["transfer"];
+    }
+  | {
+      kind: "transfer_ready";
+      sourceAccountId: string;
+      sourceAccountName: string;
+      sourceCurrency: string;
+      destinationAccountId: string;
+      destinationAccountName: string;
+      destinationCurrency: string;
+      sourceAmount: number;
+      destinationAmount: number;
+      replaceTransferId?: string;
+      operationIds: RecordOperationIds["transfer"];
     };
 
 interface BotSession {
@@ -299,6 +330,30 @@ function compactTitle(title: string): string {
   return title.length > 38 ? `${title.slice(0, 35)}...` : title;
 }
 
+function createTransactionId(): string {
+  return `tx_${randomUUID().slice(0, 12)}`;
+}
+
+function createTransferOperationIds(): RecordOperationIds["transfer"] {
+  return {
+    transferId: `tr_${randomUUID().slice(0, 12)}`,
+    sourceTransactionId: createTransactionId(),
+    destinationTransactionId: createTransactionId(),
+  };
+}
+
+function operationIdsForUpdate(ctx: BotContext): RecordOperationIds {
+  const updateId = ctx.update.update_id.toString(36);
+  return {
+    transactionId: `tx_u${updateId}`,
+    transfer: {
+      transferId: `tr_u${updateId}`,
+      sourceTransactionId: `tx_u${updateId}_out`,
+      destinationTransactionId: `tx_u${updateId}_in`,
+    },
+  };
+}
+
 function formatRate(rate: number): string {
   return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 6 }).format(rate);
 }
@@ -413,7 +468,7 @@ export function createBot(
 
   bot.use(async (ctx, next) => {
     if (
-      config.allowedTelegramUserIds.size &&
+      !config.allowPublicAccess &&
       (!ctx.from || !config.allowedTelegramUserIds.has(ctx.from.id))
     ) {
       await ctx.reply("У этого пользователя нет доступа к боту.");
@@ -521,15 +576,18 @@ export function createBot(
     const balanceLines = balances.length
       ? balances.slice(0, 4).map((item) => `• ${item.name}: ${formatMoney(item.balance, item.currency)}`)
       : ["• Счета ещё не добавлены"];
+    const dailyBudgetLine = dashboard.budgets.daily
+      ? dashboard.budgets.daily.remaining >= 0
+        ? `Бюджет дня: ${Math.round(dashboard.budgets.daily.percent)}% · осталось ${formatMoney(dashboard.budgets.daily.remaining, baseCurrency)}`
+        : `⚠ Бюджет дня превышен на ${formatMoney(-dashboard.budgets.daily.remaining, baseCurrency)}`
+      : null;
     const lines = [
       ...(notice ? [notice, ""] : []),
       `✈ ${dashboard.connection.title}`,
       `Дом · ${timezoneLabel(homeTimezone, HOME_TIMEZONES)}: ${formatTime(homeTimezone)}`,
       `На месте · ${timezoneLabel(localTimezone, LOCAL_TIMEZONES)}: ${formatTime(localTimezone)}`,
       todayLine,
-      ...(dashboard.budgets.daily
-        ? [`Бюджет дня: ${Math.round(dashboard.budgets.daily.percent)}% · осталось ${formatMoney(Math.max(0, dashboard.budgets.daily.remaining), baseCurrency)}`]
-        : []),
+      ...(dailyBudgetLine ? [dailyBudgetLine] : []),
       "",
       "Остатки",
       ...balanceLines,
@@ -552,6 +610,27 @@ export function createBot(
     }
   }
 
+  async function finishBaseCurrencySetup(ctx: BotContext, notice: string): Promise<void> {
+    const accounts = await service.getAccounts(chatId(ctx));
+    if (accounts.length) {
+      await sendSettings(ctx, notice);
+      return;
+    }
+    await showScreen(
+      ctx,
+      [
+        notice,
+        "",
+        "Настройка поездки · 2/2",
+        "Добавь первый счёт: карту, наличные или другой источник денег.",
+      ].join("\n"),
+      new InlineKeyboard()
+        .text("＋ Добавить первый счёт", "account:add")
+        .row()
+        .text("Пока пропустить", "menu:home"),
+    );
+  }
+
   async function selectBaseCurrency(ctx: BotContext, input: string): Promise<void> {
     const currency = normalizeCurrencyCode(input);
     if (!currency) {
@@ -567,7 +646,7 @@ export function createBot(
     if (rubRate) {
       await service.setBaseCurrency(chatId(ctx), currency);
       ctx.session.flow = { kind: "idle" };
-      await sendSettings(ctx, `✓ Базовая валюта изменена на ${currency}.`);
+      await finishBaseCurrencySetup(ctx, `✓ Базовая валюта изменена на ${currency}.`);
       return;
     }
     ctx.session.flow = { kind: "base_currency_rate", currency };
@@ -1168,6 +1247,14 @@ export function createBot(
       await showScreen(ctx, `Новый перевод · 3/3\n${flow.sourceAccountName} → ${flow.destinationAccountName}\n\nСколько списано в ${flow.sourceCurrency}?`, cancelKeyboard());
       return;
     }
+    if (flow.kind === "transfer_ready") {
+      ctx.session.flow = {
+        ...flow,
+        kind: "transfer_source_amount",
+      };
+      await showScreen(ctx, `Новый перевод · 3/3\n${flow.sourceAccountName} → ${flow.destinationAccountName}\n\nСколько списано в ${flow.sourceCurrency}?`, cancelKeyboard());
+      return;
+    }
     if (flow.kind.startsWith("history_edit_")) {
       await showTransactionEditMenu(ctx, (flow as { transactionId: string }).transactionId);
       return;
@@ -1284,14 +1371,26 @@ export function createBot(
     ctx: BotContext,
     data: {
       sourceAccountId: string;
+      sourceAccountName: string;
+      sourceCurrency: string;
       destinationAccountId: string;
+      destinationAccountName: string;
+      destinationCurrency: string;
       sourceAmount: number;
       destinationAmount: number;
       replaceTransferId?: string;
+      operationIds?: RecordOperationIds["transfer"];
     },
   ): Promise<void> {
+    const readyFlow: Extract<Flow, { kind: "transfer_ready" }> = {
+      ...data,
+      kind: "transfer_ready",
+      operationIds: data.operationIds ?? createTransferOperationIds(),
+    };
+    ctx.session.flow = readyFlow;
     try {
       const input = {
+        operationIds: readyFlow.operationIds,
         chatId: chatId(ctx),
         sourceAccountId: data.sourceAccountId,
         destinationAccountId: data.destinationAccountId,
@@ -1310,7 +1409,19 @@ export function createBot(
         data.replaceTransferId ? "✓ Перевод исправлен" : "✓ Перевод записан",
       );
     } catch (error) {
-      await replyError(ctx, error);
+      if (error instanceof UserFacingError) {
+        await showScreen(ctx, error.message, cancelKeyboard());
+        return;
+      }
+      console.error("Не удалось подтвердить запись перевода:", error);
+      await showScreen(
+        ctx,
+        "Не удалось подтвердить запись в Google Sheets. Операция могла сохраниться — повтор использует тот же ID и не создаст дубль.",
+        new InlineKeyboard()
+          .text("↻ Проверить и повторить", "transfer:retry")
+          .row()
+          .text("× Отменить", "flow:cancel"),
+      );
     }
   }
 
@@ -1383,8 +1494,11 @@ export function createBot(
   async function completeTransaction(ctx: BotContext, description: string): Promise<void> {
     const flow = ctx.session.flow;
     if (flow.kind !== "transaction_description") return;
+    const transactionId = flow.transactionId ?? createTransactionId();
+    ctx.session.flow = { ...flow, transactionId, description };
     try {
       const transaction = await service.recordTransaction({
+        transactionId,
         chatId: chatId(ctx),
         type: flow.type,
         accountId: flow.accountId,
@@ -1398,7 +1512,19 @@ export function createBot(
       ctx.session.flow = { kind: "idle" };
       await showRecordedTransaction(ctx, transaction);
     } catch (error) {
-      await replyError(ctx, error);
+      if (error instanceof UserFacingError) {
+        await showScreen(ctx, error.message, cancelKeyboard());
+        return;
+      }
+      console.error("Не удалось подтвердить запись операции:", error);
+      await showScreen(
+        ctx,
+        "Не удалось подтвердить запись в Google Sheets. Операция могла сохраниться — повтор использует тот же ID и не создаст дубль.",
+        new InlineKeyboard()
+          .text("↻ Проверить и повторить", "tx:retry")
+          .row()
+          .text("× Отменить", "flow:cancel"),
+      );
     }
   }
 
@@ -1458,11 +1584,14 @@ export function createBot(
     text: string,
     commandOverride?: NaturalCommand,
     forcedAccountId?: string,
+    operationIdsOverride?: RecordOperationIds,
   ): Promise<void> {
     if (!naturalInput.enabled) {
       await sendMain(ctx, "Естественный ввод пока не настроен. Добавь OPENAI_API_KEY или используй кнопки.");
       return;
     }
+    let retryCommand = commandOverride;
+    const operationIds = operationIdsOverride ?? operationIdsForUpdate(ctx);
     try {
       const [connection, accounts, categories, baseCurrency] = await Promise.all([
         service.getConnection(chatId(ctx)),
@@ -1477,6 +1606,7 @@ export function createBot(
         accounts: accounts.map((account) => ({ name: account.name, currency: account.currency })),
         categories,
       });
+      retryCommand = command;
       ctx.session.flow = { kind: "idle" };
 
       if (command.intent === "balance") {
@@ -1514,6 +1644,7 @@ export function createBot(
           return;
         }
         const transfer = await service.recordTransfer({
+          operationIds: operationIds.transfer,
           chatId: chatId(ctx),
           sourceAccountId: source.id,
           destinationAccountId: destination.id,
@@ -1557,6 +1688,7 @@ export function createBot(
           return;
         }
         const transaction = await service.recordTransaction({
+          transactionId: operationIds.transactionId,
           chatId: chatId(ctx),
           type: "income",
           accountId: account.id,
@@ -1585,6 +1717,7 @@ export function createBot(
             )
       );
       const transaction = await service.recordTransaction({
+        transactionId: operationIds.transactionId,
         chatId: chatId(ctx),
         type: "expense",
         accountId: account.id,
@@ -1597,12 +1730,30 @@ export function createBot(
       });
       await showRecordedTransaction(ctx, transaction);
     } catch (error) {
-      ctx.session.flow = { kind: "idle" };
       if (error instanceof UserFacingError) {
+        ctx.session.flow = { kind: "idle" };
         await showScreen(ctx, error.message, backKeyboard());
         return;
       }
       console.error("Ошибка естественного ввода:", error);
+      if (retryCommand) {
+        ctx.session.flow = {
+          kind: "natural_retry",
+          command: retryCommand,
+          forcedAccountId,
+          operationIds,
+        };
+        await showScreen(
+          ctx,
+          "Не удалось подтвердить запись в Google Sheets. Операция могла сохраниться — повтор использует тот же ID и не создаст дубль.",
+          new InlineKeyboard()
+            .text("↻ Проверить и повторить", "natural:retry")
+            .row()
+            .text("× Отменить", "flow:cancel"),
+        );
+        return;
+      }
+      ctx.session.flow = { kind: "idle" };
       await showScreen(
         ctx,
         "Не удалось разобрать сообщение. Данные не записаны — попробуй ещё раз или используй кнопки.",
@@ -1627,6 +1778,82 @@ export function createBot(
       if (sameCurrency.length === 1) return sameCurrency[0] ?? null;
     }
     return accounts.length === 1 ? accounts[0] ?? null : null;
+  }
+
+  async function performQuickRecord(
+    ctx: BotContext,
+    flow: Extract<Flow, { kind: "quick_record_retry" }>,
+  ): Promise<void> {
+    ctx.session.flow = flow;
+    try {
+      const transaction = flow.action === "repeat"
+        ? await service.repeatTransaction(
+            chatId(ctx),
+            flow.referenceId,
+            telegramUser(ctx),
+            flow.operationIds,
+          )
+        : await service.useFavorite(
+            chatId(ctx),
+            flow.referenceId,
+            telegramUser(ctx),
+            flow.operationIds.transactionId,
+          );
+      ctx.session.flow = { kind: "idle" };
+      if (transaction.transferId) {
+        const pair = await service.getTransferPair(chatId(ctx), transaction.transferId);
+        await showRecordedTransfer(ctx, pair, "✓ Перевод повторён");
+      } else {
+        await showRecordedTransaction(ctx, transaction);
+      }
+    } catch (error) {
+      if (error instanceof UserFacingError) {
+        await replyError(ctx, error);
+        return;
+      }
+      console.error("Не удалось подтвердить быструю операцию:", error);
+      await showScreen(
+        ctx,
+        "Не удалось подтвердить запись в Google Sheets. Операция могла сохраниться — повтор использует тот же ID и не создаст дубль.",
+        new InlineKeyboard()
+          .text("↻ Проверить и повторить", "record:retry")
+          .row()
+          .text("× Отменить", "flow:cancel"),
+      );
+    }
+  }
+
+  async function sendSystemStatus(ctx: BotContext): Promise<void> {
+    try {
+      const status = await service.getSystemStatus(chatId(ctx));
+      const queueState = status.failedMoneySync
+        ? `⚠ Ошибок Money: ${status.failedMoneySync}`
+        : status.pendingMoneySync
+          ? `Ожидают Money: ${status.pendingMoneySync}`
+          : "✓ Очередь Money пуста";
+      const lastSync = status.lastMoneySyncedAt
+        ? new Intl.DateTimeFormat("ru-RU", {
+            dateStyle: "short",
+            timeStyle: "medium",
+          }).format(new Date(status.lastMoneySyncedAt))
+        : "ещё не было";
+      await showScreen(
+        ctx,
+        [
+          "Диагностика",
+          `✈ ${status.connectionTitle}`,
+          "✓ Google Sheets отвечает",
+          queueState,
+          `Счетов: ${status.accounts}`,
+          `Активных записей: ${status.activeTransactions}`,
+          `Последняя синхронизация Money: ${lastSync}`,
+          `Ответ: ${status.responseTimeMs} мс`,
+        ].join("\n"),
+        backKeyboard(),
+      );
+    } catch (error) {
+      await replyError(ctx, error);
+    }
   }
 
   bot.command("start", (ctx) => sendMain(ctx));
@@ -1657,6 +1884,7 @@ export function createBot(
   bot.command("transfer", (ctx) => startTransfer(ctx));
   bot.command("today", (ctx) => sendSummary(ctx, true));
   bot.command("rates", (ctx) => sendRates(ctx));
+  bot.command("status", (ctx) => sendSystemStatus(ctx));
   bot.command("undo", undo);
   bot.command("cancel", async (ctx) => {
     ctx.session.flow = { kind: "idle" };
@@ -1834,12 +2062,42 @@ export function createBot(
     await ctx.answerCallbackQuery();
     await completeTransaction(ctx, "");
   });
+  bot.callbackQuery("tx:retry", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const flow = ctx.session.flow;
+    if (flow.kind !== "transaction_description") return;
+    await completeTransaction(ctx, flow.description ?? "");
+  });
+  bot.callbackQuery("transfer:retry", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const flow = ctx.session.flow;
+    if (flow.kind !== "transfer_ready") return;
+    await completeTransfer(ctx, flow);
+  });
 
   bot.callbackQuery(/^natural:account:(.+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const flow = ctx.session.flow;
     if (flow.kind !== "natural_account") return;
     await processNaturalText(ctx, "", flow.command, ctx.match[1]);
+  });
+  bot.callbackQuery("natural:retry", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const flow = ctx.session.flow;
+    if (flow.kind !== "natural_retry") return;
+    await processNaturalText(
+      ctx,
+      "",
+      flow.command,
+      flow.forcedAccountId,
+      flow.operationIds,
+    );
+  });
+  bot.callbackQuery("record:retry", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const flow = ctx.session.flow;
+    if (flow.kind !== "quick_record_retry") return;
+    await performQuickRecord(ctx, flow);
   });
 
   bot.callbackQuery(/^history:view:([a-zA-Z0-9_-]+)$/, async (ctx) => {
@@ -1848,21 +2106,12 @@ export function createBot(
   });
   bot.callbackQuery(/^history:repeat:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    try {
-      const transaction = await service.repeatTransaction(
-        chatId(ctx),
-        ctx.match[1],
-        telegramUser(ctx),
-      );
-      if (transaction.transferId) {
-        const pair = await service.getTransferPair(chatId(ctx), transaction.transferId);
-        await showRecordedTransfer(ctx, pair, "✓ Перевод повторён");
-      } else {
-        await showRecordedTransaction(ctx, transaction);
-      }
-    } catch (error) {
-      await replyError(ctx, error);
-    }
+    await performQuickRecord(ctx, {
+      kind: "quick_record_retry",
+      action: "repeat",
+      referenceId: ctx.match[1],
+      operationIds: operationIdsForUpdate(ctx),
+    });
   });
   bot.callbackQuery(/^history:favorite:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -1875,13 +2124,12 @@ export function createBot(
   });
   bot.callbackQuery(/^favorite:use:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    try {
-      const transaction = await service.useFavorite(chatId(ctx), ctx.match[1], telegramUser(ctx));
-      ctx.session.flow = { kind: "idle" };
-      await showRecordedTransaction(ctx, transaction);
-    } catch (error) {
-      await replyError(ctx, error);
-    }
+    await performQuickRecord(ctx, {
+      kind: "quick_record_retry",
+      action: "favorite",
+      referenceId: ctx.match[1],
+      operationIds: operationIdsForUpdate(ctx),
+    });
   });
   bot.callbackQuery(/^favorite:remove:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -1927,7 +2175,11 @@ export function createBot(
   bot.callbackQuery(/^history:edit:amount:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const transaction = await service.getTransaction(chatId(ctx), ctx.match[1]);
-    ctx.session.flow = { kind: "history_edit_amount", transactionId: transaction.id };
+    ctx.session.flow = {
+      kind: "history_edit_amount",
+      transactionId: transaction.id,
+      replacementTransactionId: createTransactionId(),
+    };
     await showScreen(
       ctx,
       `Текущая сумма: ${formatMoney(transaction.purchaseAmount, transaction.purchaseCurrency)}\n\nОтправь новую сумму.`,
@@ -1937,7 +2189,11 @@ export function createBot(
   bot.callbackQuery(/^history:edit:description:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const transaction = await service.getTransaction(chatId(ctx), ctx.match[1]);
-    ctx.session.flow = { kind: "history_edit_description", transactionId: transaction.id };
+    ctx.session.flow = {
+      kind: "history_edit_description",
+      transactionId: transaction.id,
+      replacementTransactionId: createTransactionId(),
+    };
     await showScreen(
       ctx,
       `Текущее название: ${transaction.description || transaction.category}\n\nОтправь новое название.`,
@@ -1953,6 +2209,7 @@ export function createBot(
     ctx.session.flow = {
       kind: "history_edit_category",
       transactionId: transaction.id,
+      replacementTransactionId: createTransactionId(),
       categories,
     };
     const keyboard = new InlineKeyboard();
@@ -1975,6 +2232,7 @@ export function createBot(
         flow.transactionId,
         { category },
         telegramUser(ctx),
+        flow.replacementTransactionId,
       );
       ctx.session.flow = { kind: "idle" };
       await sendTransactionDetail(ctx, replacement.id, "✓ Категория исправлена.");
@@ -1988,7 +2246,11 @@ export function createBot(
       service.getTransaction(chatId(ctx), ctx.match[1]),
       service.getBalances(chatId(ctx)),
     ]);
-    ctx.session.flow = { kind: "history_edit_account", transactionId: transaction.id };
+    ctx.session.flow = {
+      kind: "history_edit_account",
+      transactionId: transaction.id,
+      replacementTransactionId: createTransactionId(),
+    };
     const keyboard = new InlineKeyboard();
     accounts.forEach((account, index) => {
       keyboard.text(account.name, `history:account:${account.id}`);
@@ -2027,6 +2289,7 @@ export function createBot(
           ...(transaction.type === "income" ? { purchaseCurrency: account.currency } : {}),
         },
         telegramUser(ctx),
+        flow.replacementTransactionId,
       );
       ctx.session.flow = { kind: "idle" };
       await sendTransactionDetail(ctx, replacement.id, "✓ Счёт исправлен.");
@@ -2154,6 +2417,7 @@ export function createBot(
         destinationAccountName: destination.name,
         destinationCurrency: destination.currency,
         replaceTransferId: flow.replaceTransferId,
+        operationIds: createTransferOperationIds(),
       };
       await showScreen(
         ctx,
@@ -2272,6 +2536,7 @@ export function createBot(
       purchaseAmount: flow.purchaseAmount,
       purchaseCurrency: flow.purchaseCurrency,
       category,
+      transactionId: createTransactionId(),
     };
     await showScreen(
       ctx,
@@ -2406,7 +2671,7 @@ export function createBot(
         await service.setCurrencyRubRate(chatId(ctx), flow.currency, rubRate);
         await service.setBaseCurrency(chatId(ctx), flow.currency);
         ctx.session.flow = { kind: "idle" };
-        await sendSettings(
+        await finishBaseCurrencySetup(
           ctx,
           `✓ Базовая валюта: ${flow.currency}.\n1 ${flow.currency} = ${formatRate(rubRate)} RUB.`,
         );
@@ -2488,6 +2753,7 @@ export function createBot(
           purchaseAmount: accountAmount,
           purchaseCurrency: flow.accountCurrency,
           category: "Пополнение",
+          transactionId: createTransactionId(),
         };
         await showScreen(
           ctx,
@@ -2567,6 +2833,7 @@ export function createBot(
           original.id,
           { purchaseAmount, accountAmount },
           telegramUser(ctx),
+          flow.replacementTransactionId,
         );
         ctx.session.flow = { kind: "idle" };
         await sendTransactionDetail(ctx, replacement.id, "✓ Сумма исправлена.");
@@ -2582,6 +2849,7 @@ export function createBot(
           flow.transactionId,
           { description: text },
           telegramUser(ctx),
+          flow.replacementTransactionId,
         );
         ctx.session.flow = { kind: "idle" };
         await sendTransactionDetail(ctx, replacement.id, "✓ Название исправлено.");

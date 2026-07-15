@@ -81,8 +81,9 @@ cp .env.example .env
 3. Put the returned token in `TELEGRAM_BOT_TOKEN`.
 4. Add your numeric Telegram user ID to `ALLOWED_TELEGRAM_USER_IDS`.
 
-Leaving the allowlist empty makes the bot available to anyone who finds its
-username.
+Access is closed by default. Set at least one `ALLOWED_TELEGRAM_USER_IDS` value.
+Public access requires the explicit `ALLOW_PUBLIC_ACCESS=true` opt-in and is not
+recommended for a bot that can write to financial spreadsheets.
 
 ### 3. Configure Google
 
@@ -120,7 +121,8 @@ After that, use the inline control panel.
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | One of two | Full service account JSON as one line. Useful in hosted environments. |
 | `STATE_FILE` | No | Trip registry path. Defaults to `./data/state.json`. |
 | `DEFAULT_TIMEZONE` | No | Default operation timezone for newly connected trips. |
-| `ALLOWED_TELEGRAM_USER_IDS` | Recommended | Comma-separated numeric Telegram user IDs. |
+| `ALLOWED_TELEGRAM_USER_IDS` | Yes by default | Comma-separated numeric Telegram user IDs allowed to use the bot. |
+| `ALLOW_PUBLIC_ACCESS` | No | Explicitly set `true` to run without an allowlist. Defaults to `false`. |
 | `OPENAI_API_KEY` | No | Enables natural-language text and Telegram voice input. |
 | `OPENAI_TEXT_MODEL` | No | Structured command parser. Defaults to `gpt-5-mini`. |
 | `OPENAI_TRANSCRIBE_MODEL` | No | Voice transcription model. Defaults to `gpt-4o-mini-transcribe`. |
@@ -177,7 +179,7 @@ Commands registered in the BotFather menu:
 | `/help` | Show a short usage guide. |
 
 Legacy shortcuts including `/connect`, `/undo`, `/cancel`, `/rates`, `/today`,
-and `/skip` remain implemented but are intentionally omitted from the compact
+`/skip`, and the diagnostic `/status` remain implemented but are intentionally omitted from the compact
 BotFather menu.
 
 ## Google Sheets Contract
