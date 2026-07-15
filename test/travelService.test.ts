@@ -8,6 +8,7 @@ const config: AppConfig = {
   stateFile: "unused",
   defaultTimezone: "Asia/Tokyo",
   allowedTelegramUserIds: new Set(),
+  allowPublicAccess: true,
   openaiTextModel: "gpt-5-mini",
   openaiTranscribeModel: "gpt-4o-mini-transcribe",
   voiceMaxSeconds: 120,
@@ -53,6 +54,7 @@ describe("TravelService transfers", () => {
           { ...pair[0], rowNumber: transactions.length + 5 },
           { ...pair[1], rowNumber: transactions.length + 6 },
         );
+        return pair;
       },
       markTransactionsDeleted: async (
         _spreadsheetId: string,
@@ -168,6 +170,56 @@ describe("TravelService dashboard and digest", () => {
     lastSent = "2026-07-14";
     expect(await service.getDueDigests(now)).toEqual([]);
   });
+
+  it("объединяет частые проверки ручного Money в один API-запрос", async () => {
+    let syncCalls = 0;
+    const result = { imported: 0, updated: 0, deleted: 0, unresolved: 0 };
+    const gateway = {
+      syncManualMoneyTransactions: async () => {
+        syncCalls += 1;
+        return result;
+      },
+    };
+    const stateStore = {
+      getConnection: async () => ({
+        spreadsheetId: "sheet",
+        title: "Япония",
+        connectedAt: "2026-07-14T00:00:00.000Z",
+      }),
+    };
+    const service = new TravelService(gateway as never, stateStore as never, config);
+
+    await Promise.all([service.syncManualMoney("42"), service.syncManualMoney("42")]);
+
+    expect(syncCalls).toBe(1);
+  });
+
+  it("возвращает безопасную эксплуатационную диагностику без spreadsheet ID", async () => {
+    const gateway = {
+      getAccounts: async () => [],
+      getTransactions: async () => [],
+      getSettings: async () => new Map(),
+    };
+    const stateStore = {
+      getConnection: async () => ({
+        spreadsheetId: "secret-sheet-id",
+        title: "Япония",
+        connectedAt: "2026-07-14T00:00:00.000Z",
+      }),
+    };
+    const service = new TravelService(gateway as never, stateStore as never, config);
+
+    const status = await service.getSystemStatus("42");
+
+    expect(status).toMatchObject({
+      connectionTitle: "Япония",
+      accounts: 0,
+      activeTransactions: 0,
+      pendingMoneySync: 0,
+      failedMoneySync: 0,
+    });
+    expect(JSON.stringify(status)).not.toContain("secret-sheet-id");
+  });
 });
 
 describe("TravelService custom base currency", () => {
@@ -205,5 +257,118 @@ describe("TravelService custom base currency", () => {
     expect(JSON.parse(settings.get("currency_rates_json")!)).toMatchObject({ RUB: 1, AED: 21.5 });
     expect(String(settings.get("base_currency_rub_rate"))).toBe("21.5");
     expect(updatedRates).toEqual([["AED", 21.5]]);
+  });
+});
+
+describe("TravelService replacement recovery", () => {
+  function originalIncome(): StoredTransaction {
+    return {
+      id: "tx_original",
+      createdAt: "2026-07-15T08:00:00.000Z",
+      date: "15.07.2026",
+      type: "income",
+      accountId: "rub",
+      accountName: "Карта RUB",
+      amount: 1000,
+      currency: "RUB",
+      purchaseAmount: 1000,
+      purchaseCurrency: "RUB",
+      amountRub: 1000,
+      amountUsd: null,
+      amountJpy: null,
+      usdJpyRate: null,
+      usdRubRate: null,
+      jpyRubRate: null,
+      category: "Пополнение",
+      description: "Исходное пополнение",
+      telegramUser: "@owner",
+      chatId: "42",
+      deletedAt: "",
+      moneySyncStatus: "not_applicable",
+      moneySyncError: "",
+      moneySyncedAt: "",
+      transferId: "",
+      rowNumber: 5,
+    };
+  }
+
+  function replacementService(
+    markOriginal: (transaction: StoredTransaction, deletedAt: string) => void,
+  ) {
+    const transactions = [originalIncome()];
+    const account: Account = {
+      id: "rub",
+      name: "Карта RUB",
+      kind: "card",
+      currency: "RUB",
+      openingBalance: 0,
+      rubRate: 1,
+      active: true,
+    };
+    const gateway = {
+      getAccounts: async () => [account],
+      getSettings: async () => new Map([["timezone", "Europe/Moscow"]]),
+      getTransactions: async () => transactions,
+      appendTransaction: async (_spreadsheetId: string, value: TravelTransaction) => {
+        const stored = { ...value, rowNumber: transactions.length + 5 };
+        transactions.push(stored);
+        return stored;
+      },
+      markTransactionDeleted: async (
+        _spreadsheetId: string,
+        value: StoredTransaction,
+        deletedAt: string,
+      ) => markOriginal(value, deletedAt),
+    };
+    const stateStore = {
+      getConnection: async () => ({
+        spreadsheetId: "sheet",
+        title: "Поездка",
+        connectedAt: "2026-07-15T00:00:00.000Z",
+      }),
+    };
+    return {
+      service: new TravelService(gateway as never, stateStore as never, config),
+      transactions,
+    };
+  }
+
+  it("при потерянном ответе после удаления признаёт замену успешной", async () => {
+    let calls = 0;
+    const { service, transactions } = replacementService((value, deletedAt) => {
+      calls += 1;
+      value.deletedAt = deletedAt;
+      throw new Error("response lost after delete");
+    });
+
+    const replacement = await service.replaceTransaction(
+      "42",
+      "tx_original",
+      { purchaseAmount: 1500, accountAmount: 1500 },
+      "@owner",
+    );
+
+    expect(calls).toBe(1);
+    expect(transactions.find((item) => item.id === "tx_original")?.deletedAt).not.toBe("");
+    expect(transactions.find((item) => item.id === replacement.id)?.deletedAt).toBe("");
+  });
+
+  it("откатывает замену только когда исходная операция подтверждённо активна", async () => {
+    const { service, transactions } = replacementService((value, deletedAt) => {
+      if (value.id === "tx_original") throw new Error("delete rejected");
+      value.deletedAt = deletedAt;
+    });
+
+    await expect(
+      service.replaceTransaction(
+        "42",
+        "tx_original",
+        { purchaseAmount: 1500, accountAmount: 1500 },
+        "@owner",
+      ),
+    ).rejects.toThrow(/delete rejected/);
+
+    expect(transactions.find((item) => item.id === "tx_original")?.deletedAt).toBe("");
+    expect(transactions.at(-1)?.deletedAt).not.toBe("");
   });
 });

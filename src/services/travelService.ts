@@ -29,6 +29,7 @@ export class UserFacingError extends Error {}
 const HOME_TIMEZONES = new Set(["Europe/Moscow", "Asia/Dubai", "Asia/Tokyo"]);
 
 export interface NewTransactionInput {
+  transactionId?: string;
   chatId: string;
   type: DirectTransactionType;
   accountId: string;
@@ -53,6 +54,11 @@ export interface TransactionChanges {
 }
 
 export interface NewTransferInput {
+  operationIds?: {
+    transferId: string;
+    sourceTransactionId: string;
+    destinationTransactionId: string;
+  };
   chatId: string;
   sourceAccountId: string;
   destinationAccountId: string;
@@ -67,6 +73,11 @@ export interface NewTransferInput {
 export interface RecordedTransfer {
   source: TravelTransaction;
   destination: TravelTransaction;
+}
+
+export interface RecordOperationIds {
+  transactionId: string;
+  transfer: NonNullable<NewTransferInput["operationIds"]>;
 }
 
 export interface BudgetProgress {
@@ -104,10 +115,24 @@ export interface DigestDelivery {
   budgets: BudgetStatus;
 }
 
+export interface SystemStatus {
+  connectionTitle: string;
+  accounts: number;
+  activeTransactions: number;
+  pendingMoneySync: number;
+  failedMoneySync: number;
+  lastMoneySyncedAt: string | null;
+  responseTimeMs: number;
+}
+
 export class TravelService {
   private readonly dashboardCache = new Map<
     string,
     { expiresAt: number; value: DashboardSnapshot }
+  >();
+  private readonly manualSyncCache = new Map<
+    string,
+    { expiresAt: number; promise: Promise<ManualMoneySyncResult> }
   >();
 
   constructor(
@@ -176,14 +201,55 @@ export class TravelService {
 
   async syncManualMoney(chatId: string): Promise<ManualMoneySyncResult> {
     const connection = await this.requireConnection(chatId);
-    const result = await this.gateway.syncManualMoneyTransactions(
+    const cacheKey = `${connection.spreadsheetId}:${chatId}`;
+    const cached = this.manualSyncCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.promise;
+    const promise = this.gateway.syncManualMoneyTransactions(
       connection.spreadsheetId,
       chatId,
-    );
-    if (result.imported || result.updated || result.deleted) {
-      this.invalidateDashboard(connection.spreadsheetId);
+    ).then((result) => {
+      if (result.imported || result.updated || result.deleted) {
+        this.invalidateDashboard(connection.spreadsheetId);
+      }
+      return result;
+    });
+    this.manualSyncCache.set(cacheKey, {
+      expiresAt: Date.now() + 3_000,
+      promise,
+    });
+    try {
+      return await promise;
+    } catch (error) {
+      this.manualSyncCache.delete(cacheKey);
+      throw error;
     }
-    return result;
+  }
+
+  async getSystemStatus(chatId: string): Promise<SystemStatus> {
+    const startedAt = Date.now();
+    const connection = await this.requireConnection(chatId);
+    const [accounts, transactions] = await Promise.all([
+      this.gateway.getAccounts(connection.spreadsheetId),
+      this.gateway.getTransactions(connection.spreadsheetId),
+    ]);
+    const active = transactions.filter((transaction) => !transaction.deletedAt);
+    const successfulSyncTimes = active
+      .map((transaction) => transaction.moneySyncedAt)
+      .filter(Boolean)
+      .sort();
+    return {
+      connectionTitle: connection.title,
+      accounts: accounts.length,
+      activeTransactions: active.length,
+      pendingMoneySync: active.filter((transaction) =>
+        transaction.type === "expense" && transaction.moneySyncStatus === "pending"
+      ).length,
+      failedMoneySync: active.filter((transaction) =>
+        transaction.type === "expense" && transaction.moneySyncStatus === "failed"
+      ).length,
+      lastMoneySyncedAt: successfulSyncTimes.at(-1) ?? null,
+      responseTimeMs: Date.now() - startedAt,
+    };
   }
 
   async initializeAllConnections(): Promise<{ prepared: number; failed: number }> {
@@ -259,11 +325,13 @@ export class TravelService {
     chatId: string,
     favoriteId: string,
     telegramUser: string,
+    transactionId?: string,
   ): Promise<TravelTransaction> {
     const favorite = (await this.stateStore.getFavorites(chatId))
       .find((item) => item.id === favoriteId);
     if (!favorite) throw new UserFacingError("Быстрый шаблон не найден.");
     const transaction = await this.recordTransaction({
+      transactionId,
       chatId,
       type: favorite.type,
       accountId: favorite.accountId,
@@ -653,7 +721,7 @@ export class TravelService {
       );
     }
     const transaction: TravelTransaction = {
-      id: `tx_${randomUUID().slice(0, 12)}`,
+      id: input.transactionId ?? `tx_${randomUUID().slice(0, 12)}`,
       createdAt: new Date().toISOString(),
       date: formatDate(input.date ?? dateInTimezone(new Date(), timezone)),
       type: input.type,
@@ -674,9 +742,9 @@ export class TravelService {
       moneySyncedAt: "",
       transferId: "",
     };
-    await this.gateway.appendTransaction(connection.spreadsheetId, transaction);
+    const stored = await this.gateway.appendTransaction(connection.spreadsheetId, transaction);
     this.invalidateDashboard(connection.spreadsheetId);
-    return transaction;
+    return stored;
   }
 
   async recordTransfer(input: NewTransferInput): Promise<RecordedTransfer> {
@@ -718,7 +786,12 @@ export class TravelService {
     if (convertedSource.amountRub === null || convertedDestination.amountRub === null) {
       throw new UserFacingError("Не хватает курса одного из счетов для записи перевода.");
     }
-    const transferId = `tr_${randomUUID().slice(0, 12)}`;
+    const operationIds = input.operationIds ?? {
+      transferId: `tr_${randomUUID().slice(0, 12)}`,
+      sourceTransactionId: `tx_${randomUUID().slice(0, 12)}`,
+      destinationTransactionId: `tx_${randomUUID().slice(0, 12)}`,
+    };
+    const transferId = operationIds.transferId;
     const createdAt = new Date().toISOString();
     const timezone = settings.get("timezone") || this.config.defaultTimezone;
     const date = formatDate(input.date ?? dateInTimezone(new Date(), timezone));
@@ -741,7 +814,7 @@ export class TravelService {
     };
     const source: TravelTransaction = {
       ...common,
-      id: `tx_${randomUUID().slice(0, 12)}`,
+      id: operationIds.sourceTransactionId,
       type: "transfer_out",
       accountId: sourceAccount.id,
       accountName: sourceAccount.name,
@@ -753,7 +826,7 @@ export class TravelService {
     };
     const destination: TravelTransaction = {
       ...common,
-      id: `tx_${randomUUID().slice(0, 12)}`,
+      id: operationIds.destinationTransactionId,
       type: "transfer_in",
       accountId: destinationAccount.id,
       accountName: destinationAccount.name,
@@ -763,12 +836,12 @@ export class TravelService {
       purchaseCurrency: destinationAccount.currency,
       ...convertedDestination,
     };
-    await this.gateway.appendTransferTransactions(
+    const stored = await this.gateway.appendTransferTransactions(
       connection.spreadsheetId,
       [source, destination],
     );
     this.invalidateDashboard(connection.spreadsheetId);
-    return { source, destination };
+    return { source: stored[0], destination: stored[1] };
   }
 
   async replaceTransfer(
@@ -776,6 +849,19 @@ export class TravelService {
     input: NewTransferInput,
   ): Promise<RecordedTransfer> {
     const connection = await this.requireConnection(input.chatId);
+    if (input.operationIds) {
+      const current = await this.gateway.getTransactions(connection.spreadsheetId);
+      const source = current.find((transaction) =>
+        transaction.id === input.operationIds?.sourceTransactionId && !transaction.deletedAt
+      );
+      const destination = current.find((transaction) =>
+        transaction.id === input.operationIds?.destinationTransactionId && !transaction.deletedAt
+      );
+      const originalActive = current.some((transaction) =>
+        transaction.transferId === transferId && !transaction.deletedAt
+      );
+      if (source && destination && !originalActive) return { source, destination };
+    }
     const original = await this.getTransferPair(input.chatId, transferId);
     const replacement = await this.recordTransfer({
       ...input,
@@ -792,18 +878,30 @@ export class TravelService {
         new Date().toISOString(),
       );
     } catch (error) {
+      let current: StoredTransaction[];
       try {
-        const storedReplacement = await this.getTransferPair(
-          input.chatId,
-          replacement.source.transferId,
-        );
-        await this.gateway.markTransactionsDeleted(
-          connection.spreadsheetId,
-          [storedReplacement.source, storedReplacement.destination],
-          new Date().toISOString(),
-        );
-      } catch (rollbackError) {
-        console.error("Не удалось откатить заменяющий перевод:", rollbackError);
+        current = await this.gateway.getTransactions(connection.spreadsheetId);
+      } catch (verificationError) {
+        console.error("Не удалось проверить состояние после ошибки исправления перевода:", verificationError);
+        throw error;
+      }
+      const originalStillActive = current.some((transaction) =>
+        transaction.transferId === transferId && !transaction.deletedAt
+      );
+      if (!originalStillActive) return replacement;
+      const storedReplacement = current.filter((transaction) =>
+        transaction.transferId === replacement.source.transferId && !transaction.deletedAt
+      );
+      if (storedReplacement.length === 2) {
+        try {
+          await this.gateway.markTransactionsDeleted(
+            connection.spreadsheetId,
+            storedReplacement,
+            new Date().toISOString(),
+          );
+        } catch (rollbackError) {
+          console.error("Не удалось откатить заменяющий перевод:", rollbackError);
+        }
       }
       throw error;
     }
@@ -883,11 +981,13 @@ export class TravelService {
     chatId: string,
     transactionId: string,
     telegramUser: string,
+    operationIds?: RecordOperationIds,
   ): Promise<TravelTransaction> {
     const original = await this.getTransaction(chatId, transactionId);
     if (original.transferId) {
       const pair = await this.getTransferPair(chatId, original.transferId);
       const repeated = await this.recordTransfer({
+        operationIds: operationIds?.transfer,
         chatId,
         sourceAccountId: pair.source.accountId,
         destinationAccountId: pair.destination.accountId,
@@ -902,6 +1002,7 @@ export class TravelService {
       throw new UserFacingError("Не удалось определить связанную часть перевода.");
     }
     return this.recordTransaction({
+      transactionId: operationIds?.transactionId,
       chatId,
       type: original.type,
       accountId: original.accountId,
@@ -919,8 +1020,19 @@ export class TravelService {
     transactionId: string,
     changes: TransactionChanges,
     telegramUser: string,
+    replacementTransactionId?: string,
   ): Promise<TravelTransaction> {
     const connection = await this.requireConnection(chatId);
+    if (replacementTransactionId) {
+      const current = await this.gateway.getTransactions(connection.spreadsheetId);
+      const storedReplacement = current.find((candidate) =>
+        candidate.id === replacementTransactionId && !candidate.deletedAt
+      );
+      const originalActive = current.some((candidate) =>
+        candidate.id === transactionId && !candidate.deletedAt
+      );
+      if (storedReplacement && !originalActive) return storedReplacement;
+    }
     const original = await this.getTransaction(chatId, transactionId);
     if (original.transferId) {
       throw new UserFacingError("Перевод можно повторить или отменить и создать заново.");
@@ -929,6 +1041,7 @@ export class TravelService {
       throw new UserFacingError("Эту операцию нельзя исправить как обычный расход.");
     }
     const replacement = await this.recordTransaction({
+      transactionId: replacementTransactionId,
       chatId,
       type: original.type,
       accountId: changes.accountId ?? original.accountId,
@@ -956,18 +1069,30 @@ export class TravelService {
         new Date().toISOString(),
       );
     } catch (error) {
+      let current: StoredTransaction[];
       try {
-        const storedReplacement = (await this.gateway.getTransactions(connection.spreadsheetId))
-          .find((candidate) => candidate.id === replacement.id && !candidate.deletedAt);
-        if (storedReplacement) {
+        current = await this.gateway.getTransactions(connection.spreadsheetId);
+      } catch (verificationError) {
+        console.error("Не удалось проверить состояние после ошибки исправления операции:", verificationError);
+        throw error;
+      }
+      const originalStillActive = current.some((candidate) =>
+        candidate.id === original.id && !candidate.deletedAt
+      );
+      if (!originalStillActive) return replacement;
+      const storedReplacement = current.find(
+        (candidate) => candidate.id === replacement.id && !candidate.deletedAt,
+      );
+      if (storedReplacement) {
+        try {
           await this.gateway.markTransactionDeleted(
             connection.spreadsheetId,
             storedReplacement,
             new Date().toISOString(),
           );
+        } catch (rollbackError) {
+          console.error("Не удалось откатить заменяющую операцию:", rollbackError);
         }
-      } catch (rollbackError) {
-        console.error("Не удалось откатить заменяющую операцию:", rollbackError);
       }
       throw error;
     }

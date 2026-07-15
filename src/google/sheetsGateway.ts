@@ -237,6 +237,24 @@ function normalizeMoneySyncStatus(value: unknown, type: string): MoneySyncStatus
   return type === "expense" ? "pending" : "not_applicable";
 }
 
+function sameIdempotentTransaction(
+  stored: TravelTransaction,
+  candidate: TravelTransaction,
+): boolean {
+  const sameNumber = (left: number, right: number) => Math.abs(left - right) < 1e-9;
+  return stored.id === candidate.id &&
+    stored.type === candidate.type &&
+    stored.chatId === candidate.chatId &&
+    stored.accountId === candidate.accountId &&
+    stored.currency === candidate.currency &&
+    sameNumber(stored.amount, candidate.amount) &&
+    stored.purchaseCurrency === candidate.purchaseCurrency &&
+    sameNumber(stored.purchaseAmount, candidate.purchaseAmount) &&
+    stored.category === candidate.category &&
+    stored.description === candidate.description &&
+    stored.transferId === candidate.transferId;
+}
+
 function asDateString(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) {
     return formatDate(new Date((value - 25_569) * 86_400_000).toISOString().slice(0, 10));
@@ -488,6 +506,7 @@ function accountBalanceFormula(rowNumber: number, separator: string): string {
 export class GoogleSheetsGateway {
   private readonly client: sheets_v4.Sheets;
   private readonly moneySyncLocks = new Map<string, Promise<void>>();
+  private readonly operationLocks = new Map<string, Promise<unknown>>();
 
   constructor(auth: GoogleAuthClient) {
     this.client = google.sheets({ version: "v4", auth });
@@ -788,36 +807,106 @@ export class GoogleSheetsGateway {
   async appendTransaction(
     spreadsheetId: string,
     transaction: TravelTransaction,
-  ): Promise<void> {
-    const response = await this.client.spreadsheets.values.append({
-      spreadsheetId,
-      range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: {
-        values: [transactionRow(transaction)],
-      },
+  ): Promise<TravelTransaction> {
+    return this.withOperationLock(spreadsheetId, async () => {
+      const existing = (await this.getTransactions(spreadsheetId))
+        .find((candidate) => candidate.id === transaction.id);
+      if (existing) {
+        if (!sameIdempotentTransaction(existing, transaction)) {
+          throw new Error(`Конфликт повторной операции ${transaction.id}.`);
+        }
+        if (
+          existing.type === "expense" &&
+          !existing.deletedAt &&
+          existing.moneySyncStatus !== "synced" &&
+          existing.moneySyncStatus !== "not_applicable"
+        ) {
+          existing.moneySyncStatus = await this.queueMoneySync(
+            spreadsheetId,
+            existing,
+            existing.rowNumber,
+          );
+        }
+        return existing;
+      }
+
+      let response: sheets_v4.Schema$AppendValuesResponse;
+      try {
+        const appendResponse = await this.client.spreadsheets.values.append({
+          spreadsheetId,
+          range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
+          valueInputOption: "RAW",
+          insertDataOption: "INSERT_ROWS",
+          requestBody: {
+            values: [transactionRow(transaction)],
+          },
+        });
+        response = appendResponse.data;
+      } catch (appendError) {
+        const stored = (await this.getTransactions(spreadsheetId))
+          .find((candidate) => candidate.id === transaction.id);
+        if (!stored || !sameIdempotentTransaction(stored, transaction)) throw appendError;
+        if (stored.type === "expense") {
+          stored.moneySyncStatus = await this.queueMoneySync(
+            spreadsheetId,
+            stored,
+            stored.rowNumber,
+          );
+        }
+        return stored;
+      }
+      if (transaction.type === "expense") {
+        const rowNumber = rowNumberFromUpdatedRange(response.updates?.updatedRange);
+        transaction.moneySyncStatus = await this.queueMoneySync(
+          spreadsheetId,
+          transaction,
+          rowNumber,
+        );
+      }
+      return transaction;
     });
-    if (transaction.type === "expense") {
-      const rowNumber = rowNumberFromUpdatedRange(response.data.updates?.updatedRange);
-      transaction.moneySyncStatus = await this.queueMoneySync(
-        spreadsheetId,
-        transaction,
-        rowNumber,
-      );
-    }
   }
 
   async appendTransferTransactions(
     spreadsheetId: string,
     transactions: readonly [TravelTransaction, TravelTransaction],
-  ): Promise<void> {
-    await this.client.spreadsheets.values.append({
-      spreadsheetId,
-      range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values: transactions.map(transactionRow) },
+  ): Promise<readonly [TravelTransaction, TravelTransaction]> {
+    return this.withOperationLock(spreadsheetId, async () => {
+      const stored = await this.getTransactions(spreadsheetId);
+      const source = stored.find((candidate) => candidate.id === transactions[0].id);
+      const destination = stored.find((candidate) => candidate.id === transactions[1].id);
+      if (source || destination) {
+        if (
+          !source || !destination ||
+          !sameIdempotentTransaction(source, transactions[0]) ||
+          !sameIdempotentTransaction(destination, transactions[1])
+        ) {
+          throw new Error(`Конфликт повторного перевода ${transactions[0].transferId}.`);
+        }
+        return [source, destination] as const;
+      }
+      try {
+        await this.client.spreadsheets.values.append({
+          spreadsheetId,
+          range: range(SHEETS.transactions, `A${DATA_START_ROW}:Y`),
+          valueInputOption: "RAW",
+          insertDataOption: "INSERT_ROWS",
+          requestBody: { values: transactions.map(transactionRow) },
+        });
+      } catch (appendError) {
+        const current = await this.getTransactions(spreadsheetId);
+        const source = current.find((candidate) => candidate.id === transactions[0].id);
+        const destination = current.find((candidate) => candidate.id === transactions[1].id);
+        if (
+          !source || !destination ||
+          !sameIdempotentTransaction(source, transactions[0]) ||
+          !sameIdempotentTransaction(destination, transactions[1])
+        ) {
+          throw appendError;
+        }
+        return [source, destination] as const;
+      }
+      return transactions;
     });
   }
 
@@ -1144,6 +1233,22 @@ export class GoogleSheetsGateway {
     }
   }
 
+  private async withOperationLock<T>(
+    spreadsheetId: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.operationLocks.get(spreadsheetId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(action);
+    this.operationLocks.set(spreadsheetId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.operationLocks.get(spreadsheetId) === current) {
+        this.operationLocks.delete(spreadsheetId);
+      }
+    }
+  }
+
   async getTransactions(spreadsheetId: string): Promise<StoredTransaction[]> {
     const rows = await this.getValues(spreadsheetId, range(SHEETS.transactions, `A${DATA_START_ROW}:Y`));
     return rows
@@ -1184,6 +1289,16 @@ export class GoogleSheetsGateway {
   }
 
   async markTransactionDeleted(
+    spreadsheetId: string,
+    transaction: StoredTransaction,
+    deletedAt: string,
+  ): Promise<void> {
+    await this.withMoneySyncLock(spreadsheetId, () =>
+      this.markTransactionDeletedUnlocked(spreadsheetId, transaction, deletedAt)
+    );
+  }
+
+  private async markTransactionDeletedUnlocked(
     spreadsheetId: string,
     transaction: StoredTransaction,
     deletedAt: string,
@@ -1258,6 +1373,16 @@ export class GoogleSheetsGateway {
   }
 
   async markTransactionsDeleted(
+    spreadsheetId: string,
+    transactions: StoredTransaction[],
+    deletedAt: string,
+  ): Promise<void> {
+    await this.withOperationLock(spreadsheetId, () =>
+      this.markTransactionsDeletedUnlocked(spreadsheetId, transactions, deletedAt)
+    );
+  }
+
+  private async markTransactionsDeletedUnlocked(
     spreadsheetId: string,
     transactions: StoredTransaction[],
     deletedAt: string,
