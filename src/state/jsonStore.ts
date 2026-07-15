@@ -248,34 +248,132 @@ export class JsonStateStore {
   private async load(): Promise<StoredState> {
     if (this.state) return this.state;
     try {
-      const parsed = JSON.parse(await fs.readFile(this.filePath, "utf8")) as
-        | StoredState
-        | LegacyState;
+      const parsed = parseState(await fs.readFile(this.filePath, "utf8"));
       this.state = isCurrentState(parsed) ? parsed : migrateLegacyState(parsed);
       if (!isCurrentState(parsed)) await this.queuePersist(this.state);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.state = structuredClone(EMPTY_STATE);
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.state = await this.restoreMissingPrimaryOrCreateEmpty();
+      } else {
+        this.state = await this.restoreBackup(error);
+      }
     }
     return this.state;
   }
 
+  private async restoreMissingPrimaryOrCreateEmpty(): Promise<StoredState> {
+    try {
+      const parsed = parseState(await fs.readFile(`${this.filePath}.bak`, "utf8"));
+      const recovered = isCurrentState(parsed) ? parsed : migrateLegacyState(parsed);
+      await this.queuePersist(recovered);
+      return recovered;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return structuredClone(EMPTY_STATE);
+      }
+      throw new Error(`Не удалось восстановить ${this.filePath} из резервной копии.`, {
+        cause: error,
+      });
+    }
+  }
+
+  private async restoreBackup(primaryError: unknown): Promise<StoredState> {
+    try {
+      const parsed = parseState(await fs.readFile(`${this.filePath}.bak`, "utf8"));
+      const recovered = isCurrentState(parsed) ? parsed : migrateLegacyState(parsed);
+      const corruptPath = `${this.filePath}.corrupt-${Date.now()}`;
+      try {
+        await fs.rename(this.filePath, corruptPath);
+        await this.queuePersist(recovered);
+      } catch {
+        // Keep using the valid backup in memory if the damaged file cannot be quarantined.
+      }
+      return recovered;
+    } catch (backupError) {
+      throw new Error(
+        `Не удалось прочитать ${this.filePath}; валидная резервная копия также недоступна.`,
+        { cause: { primaryError, backupError } },
+      );
+    }
+  }
+
   private async queuePersist(state: StoredState): Promise<void> {
     const snapshot = JSON.stringify(state, null, 2);
-    this.writeQueue = this.writeQueue.then(() => this.persist(snapshot));
-    await this.writeQueue;
+    const current = this.writeQueue
+      .catch(() => undefined)
+      .then(() => this.persist(snapshot));
+    this.writeQueue = current;
+    await current;
   }
 
   private async persist(content: string): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     const tempPath = `${this.filePath}.tmp`;
-    await fs.writeFile(tempPath, content, "utf8");
+    await fs.writeFile(tempPath, content, { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(tempPath, 0o600);
+    const backupPath = `${this.filePath}.bak`;
+    const backupTempPath = `${backupPath}.tmp`;
+    try {
+      await fs.copyFile(this.filePath, backupTempPath);
+      await fs.chmod(backupTempPath, 0o600);
+      await fs.rename(backupTempPath, backupPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     await fs.rename(tempPath, this.filePath);
   }
 }
 
-function isCurrentState(state: StoredState | LegacyState): state is StoredState {
-  return "version" in state && state.version === 2 && "chats" in state;
+function parseState(content: string): StoredState | LegacyState {
+  const parsed: unknown = JSON.parse(content);
+  if (isCurrentState(parsed) || isLegacyState(parsed)) return parsed;
+  throw new Error("Файл состояния имеет неподдерживаемую структуру.");
+}
+
+function isCurrentState(state: unknown): state is StoredState {
+  if (!isRecord(state) || state.version !== 2 || !isRecord(state.chats)) return false;
+  return Object.values(state.chats).every((chat) => {
+    if (
+      !isRecord(chat) || !isRecord(chat.connections) ||
+      !(chat.activeSpreadsheetId === null || typeof chat.activeSpreadsheetId === "string")
+    ) {
+      return false;
+    }
+    if (!Object.values(chat.connections).every(isSheetConnection)) return false;
+    if (chat.screenMessageId !== undefined && !Number.isInteger(chat.screenMessageId)) return false;
+    if (
+      chat.favorites !== undefined &&
+      (!isRecord(chat.favorites) || !Object.values(chat.favorites).every(Array.isArray))
+    ) {
+      return false;
+    }
+    if (
+      chat.digestLastSent !== undefined &&
+      (!isRecord(chat.digestLastSent) ||
+        !Object.values(chat.digestLastSent).every((value) => typeof value === "string"))
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function isLegacyState(state: unknown): state is LegacyState {
+  return isRecord(state) && !("version" in state) &&
+    Object.keys(state).every((key) => key === "connections") &&
+    (state.connections === undefined ||
+      (isRecord(state.connections) && Object.values(state.connections).every(isSheetConnection)));
+}
+
+function isSheetConnection(value: unknown): value is SheetConnection {
+  return isRecord(value) &&
+    typeof value.spreadsheetId === "string" &&
+    typeof value.title === "string" &&
+    typeof value.connectedAt === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function migrateLegacyState(legacy: LegacyState): StoredState {

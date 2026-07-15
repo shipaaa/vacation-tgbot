@@ -90,6 +90,54 @@ describe("JsonStateStore", () => {
     expect(await reloadedStore.getScreenMessageId("42")).toBe(1234);
   });
 
+  it("создаёт state-файл доступным только владельцу", async () => {
+    const store = new JsonStateStore(filePath);
+
+    await store.setConnection("42", japan);
+
+    const stat = await fs.stat(filePath);
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
+  it("восстанавливает очередь записи после временной файловой ошибки", async () => {
+    const blockedTempPath = `${filePath}.tmp`;
+    const store = new JsonStateStore(filePath);
+    expect(await store.getConnection("42")).toBeNull();
+    await fs.mkdir(blockedTempPath);
+
+    await expect(store.setConnection("42", japan)).rejects.toBeDefined();
+    await fs.rmdir(blockedTempPath);
+
+    await store.setScreenMessageId("42", 1234);
+
+    const reloadedStore = new JsonStateStore(filePath);
+    expect(await reloadedStore.getConnection("42")).toEqual(japan);
+    expect(await reloadedStore.getScreenMessageId("42")).toBe(1234);
+  });
+
+  it("восстанавливает подключения из последней валидной резервной копии", async () => {
+    const store = new JsonStateStore(filePath);
+    await store.setConnection("42", japan);
+    await store.setScreenMessageId("42", 1234);
+    await fs.writeFile(filePath, "{ damaged json", "utf8");
+
+    const recoveredStore = new JsonStateStore(filePath);
+
+    expect(await recoveredStore.getConnection("42")).toEqual(japan);
+    expect(JSON.parse(await fs.readFile(filePath, "utf8"))).toMatchObject({ version: 2 });
+    const files = await fs.readdir(directory);
+    expect(files.some((name) => name.startsWith("state.json.corrupt-"))).toBe(true);
+  });
+
+  it("останавливается с понятной ошибкой, если state и backup повреждены", async () => {
+    await fs.writeFile(filePath, "{ damaged json", "utf8");
+    await fs.writeFile(`${filePath}.bak`, JSON.stringify({ version: 99 }), "utf8");
+
+    const store = new JsonStateStore(filePath);
+
+    await expect(store.getConnection("42")).rejects.toThrow(/резервная копия.*недоступна/);
+  });
+
   it("восстанавливает и очищает черновик после перезапуска", async () => {
     const store = new JsonStateStore(filePath);
     await store.setBotDraft("42", { kind: "transaction_purchase_amount", purchaseAmount: 1200 });

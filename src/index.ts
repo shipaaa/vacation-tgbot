@@ -89,8 +89,8 @@ const digestTimer = setInterval(() => {
 }, 60_000);
 digestTimer.unref();
 
-if (!config.allowedTelegramUserIds.size) {
-  console.warn("ALLOWED_TELEGRAM_USER_IDS пуст: бот доступен любому пользователю.");
+if (config.allowPublicAccess) {
+  console.warn("ALLOW_PUBLIC_ACCESS=true: бот доступен любому пользователю.");
 }
 if (serviceAccountEmail) {
   console.log(`Google service account: ${serviceAccountEmail}`);
